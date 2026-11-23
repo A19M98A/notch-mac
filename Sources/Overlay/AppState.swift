@@ -10,6 +10,7 @@ enum NotchTab: String, CaseIterable, Identifiable, Codable {
     case vpn = "VPN"
     case timer = "Timer"
     case clipboard = "Clips"
+    case notifications = "Alerts"
 
     var id: String { rawValue }
 
@@ -22,6 +23,7 @@ enum NotchTab: String, CaseIterable, Identifiable, Codable {
         case .vpn: return "lock.shield.fill"
         case .timer: return "timer"
         case .clipboard: return "doc.on.clipboard"
+        case .notifications: return "bell.badge.fill"
         }
     }
 
@@ -34,6 +36,7 @@ enum NotchTab: String, CaseIterable, Identifiable, Codable {
         case .vpn: return "VPN status, quick connect & manager"
         case .timer: return "Quick timer & Pomodoro countdown"
         case .clipboard: return "Persistent clipboard history (last 100)"
+        case .notifications: return "Recent macOS notifications & quick reply"
         }
     }
 }
@@ -53,6 +56,8 @@ struct NotchPreferences: Codable, Equatable {
     var showNetworkSpeedOnHover: Bool = true
     var showVolumeHUD: Bool = true
     var showVPNDotInIdle: Bool = true
+    var showNotificationPopups: Bool = true
+    var notificationDuration: Double = 3.0
     var clipboardLimit: Int = 100
     var autoSwitchSystemMic: Bool = true
     var launchAtLogin: Bool = false
@@ -83,6 +88,7 @@ final class AppState: ObservableObject {
     let inputAudio = InputAudioManager()
     let perAppMixer = PerAppAudioMixer()
     let mediaService = MediaRemoteService()
+    let notificationService = NotificationService()
     let vpnService = VPNService()
     let networkMonitor = NetworkMonitorService()
     let timerService = TimerService()
@@ -140,6 +146,8 @@ final class AppState: ObservableObject {
     private func applyPreferencesToServices() {
         clipboardService.setMaxItems(prefs.clipboardLimit)
         inputAudio.autoSwitchSystemMic = prefs.autoSwitchSystemMic
+        notificationService.enabled = prefs.showNotificationPopups
+        notificationService.popupDuration = prefs.notificationDuration
         updateLaunchAgent(enabled: prefs.launchAtLogin)
     }
 

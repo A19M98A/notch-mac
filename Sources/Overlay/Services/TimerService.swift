@@ -15,6 +15,7 @@ final class TimerService: ObservableObject {
     @Published var isRunning: Bool = false
     @Published var label: String = "Pomodoro"
     @Published var finishedFlash: Bool = false
+    @Published var isAlarmRinging: Bool = false
 
     let presets: [TimerPreset] = [
         TimerPreset(label: "5m Break", minutes: 5, isBreak: true),
@@ -25,6 +26,7 @@ final class TimerService: ObservableObject {
     ]
 
     private var timer: Timer?
+    private var chimeTimer: Timer?
 
     var progress: Double {
         guard totalSeconds > 0 else { return 0 }
@@ -93,16 +95,50 @@ final class TimerService: ObservableObject {
 
     func stop() {
         pause()
+        dismissAlarm()
         remainingSeconds = totalSeconds
         finishedFlash = false
+    }
+
+    func dismissAlarm() {
+        isAlarmRinging = false
+        finishedFlash = false
+        chimeTimer?.invalidate()
+        chimeTimer = nil
+    }
+
+    func snooze(minutes: Int = 5) {
+        dismissAlarm()
+        totalSeconds = minutes * 60
+        remainingSeconds = minutes * 60
+        label = "+\(minutes)m Snooze"
+        start()
+    }
+
+    func restartTimer() {
+        dismissAlarm()
+        remainingSeconds = totalSeconds
+        start()
     }
 
     private func finish() {
         pause()
         finishedFlash = true
+        isAlarmRinging = true
+        playNiceChime()
+        chimeTimer?.invalidate()
+        chimeTimer = Timer.scheduledTimer(withTimeInterval: 2.6, repeats: true) { [weak self] _ in
+            guard let self, self.isAlarmRinging else { return }
+            self.playNiceChime()
+        }
+    }
+
+    private func playNiceChime() {
+        // Layered gentle macOS chime (Glass followed closely by Hero/Ping shimmer)
         NSSound(named: "Glass")?.play()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-            self?.finishedFlash = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.32) { [weak self] in
+            guard self?.isAlarmRinging == true else { return }
+            NSSound(named: "Hero")?.play()
         }
     }
 }

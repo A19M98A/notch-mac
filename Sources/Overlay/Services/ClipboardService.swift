@@ -2,6 +2,30 @@ import Foundation
 import AppKit
 import Combine
 
+enum ClipsMode: String, CaseIterable, Identifiable {
+    case text = "Text"
+    case files = "Files"
+
+    var id: String { rawValue }
+    var icon: String {
+        switch self {
+        case .text: return "doc.on.clipboard"
+        case .files: return "folder.fill"
+        }
+    }
+}
+
+struct FileShelfItem: Identifiable, Equatable, Codable {
+    let id: UUID
+    let path: String
+    let dateAdded: Date
+
+    var url: URL { URL(fileURLWithPath: path) }
+    var fileName: String { url.lastPathComponent }
+    var parentFolder: String { url.deletingLastPathComponent().lastPathComponent }
+    var exists: Bool { FileManager.default.fileExists(atPath: path) }
+}
+
 struct ClipboardItem: Identifiable, Equatable, Codable {
     let id: UUID
     let content: String
@@ -28,13 +52,16 @@ struct ClipboardItem: Identifiable, Equatable, Codable {
 }
 
 final class ClipboardService: ObservableObject {
+    @Published var clipsMode: ClipsMode = .text
     @Published var items: [ClipboardItem] = []
+    @Published var shelfFiles: [FileShelfItem] = []
     @Published var recentlyCopiedID: UUID? = nil
 
     private var lastChangeCount: Int
     private var pollTimer: Timer?
     private var maxItems = 100
     private let storageURL: URL
+    private let shelfStorageURL: URL
 
     func setMaxItems(_ limit: Int) {
         maxItems = max(10, min(500, limit))
@@ -46,9 +73,11 @@ final class ClipboardService: ObservableObject {
         let dir = "\(home)/.config/overlay"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         storageURL = URL(fileURLWithPath: "\(dir)/clipboard_history.json")
+        shelfStorageURL = URL(fileURLWithPath: "\(dir)/file_shelf.json")
 
         lastChangeCount = NSPasteboard.general.changeCount
         loadFromDisk()
+        loadShelfFromDisk()
 
         if let initial = NSPasteboard.general.string(forType: .string),
            !initial.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -136,6 +165,57 @@ final class ClipboardService: ObservableObject {
     func clearUnpinned() {
         items.removeAll { !$0.isPinned }
         saveToDisk()
+    }
+
+    // MARK: - File Shelf (Shortcut References Only — Never Copies Files)
+
+    private func loadShelfFromDisk() {
+        guard let data = try? Data(contentsOf: shelfStorageURL),
+              let saved = try? JSONDecoder().decode([FileShelfItem].self, from: data) else {
+            return
+        }
+        shelfFiles = saved.filter { $0.exists }
+    }
+
+    private func saveShelfToDisk() {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted]
+        if let data = try? encoder.encode(shelfFiles) {
+            try? data.write(to: shelfStorageURL, options: .atomic)
+        }
+    }
+
+    func addShelfURLs(_ urls: [URL]) {
+        var changed = false
+        for url in urls where url.isFileURL {
+            let path = url.standardizedFileURL.path
+            guard FileManager.default.fileExists(atPath: path) else { continue }
+            if let existingIdx = shelfFiles.firstIndex(where: { $0.path == path }) {
+                shelfFiles.remove(at: existingIdx)
+            }
+            shelfFiles.insert(FileShelfItem(id: UUID(), path: path, dateAdded: Date()), at: 0)
+            changed = true
+        }
+        if shelfFiles.count > 40 {
+            shelfFiles = Array(shelfFiles.prefix(40))
+        }
+        if changed {
+            saveShelfToDisk()
+        }
+    }
+
+    func removeShelfFile(_ item: FileShelfItem) {
+        shelfFiles.removeAll { $0.id == item.id }
+        saveShelfToDisk()
+    }
+
+    func clearShelf() {
+        shelfFiles.removeAll()
+        saveShelfToDisk()
+    }
+
+    func revealInFinder(_ item: FileShelfItem) {
+        NSWorkspace.shared.activateFileViewerSelecting([item.url])
     }
 
     private func sortAndTrim(save: Bool) {

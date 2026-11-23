@@ -290,6 +290,21 @@ struct NotchSettingsView: View {
 
                 // Behavior Toggles
                 VStack(spacing: 10) {
+                    toggleRow("Show Notification Popups Under Notch", isOn: Binding(
+                        get: { appState.prefs.showNotificationPopups },
+                        set: { v in appState.updatePreferences { $0.showNotificationPopups = v } }
+                    ))
+                    if appState.prefs.showNotificationPopups {
+                        sliderRow(
+                            title: "Notification Auto-Hide",
+                            valueText: "\(Int(round(appState.prefs.notificationDuration)))s",
+                            value: Binding(
+                                get: { appState.prefs.notificationDuration },
+                                set: { v in appState.updatePreferences { $0.notificationDuration = v } }
+                            ),
+                            range: 2...8
+                        )
+                    }
                     toggleRow("Show Network Speed on Hover", isOn: Binding(
                         get: { appState.prefs.showNetworkSpeedOnHover },
                         set: { v in appState.updatePreferences { $0.showNetworkSpeedOnHover = v } }
@@ -333,6 +348,17 @@ struct NotchSettingsView: View {
                 .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.06)))
 
                 HStack {
+                    Button("Send Test Notification") {
+                        appState.notificationService.sendTestNotification()
+                        flashHint("Test popup shown under notch")
+                    }
+                    .font(.system(size: 11, weight: .bold))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(Color.cyan.opacity(0.22)))
+                    .foregroundStyle(.cyan)
+                    .buttonStyle(.plain)
+
                     Spacer()
                     Button("Reset All Settings to Default") {
                         appState.resetAllSettings()

@@ -16,7 +16,7 @@ final class NotchWindowController: NSWindowController {
     private var collapseWorkItem: DispatchWorkItem?
     private var cancellables = Set<AnyCancellable>()
 
-    static let windowWidth: CGFloat = 620
+    static let windowWidth: CGFloat = 680
     static let windowHeight: CGFloat = 340
 
     // Stage 1: Very slim default idle strip (dots only)
@@ -28,7 +28,7 @@ final class NotchWindowController: NSWindowController {
     static let peekHeight: CGFloat = 38
 
     // Stage 3: Full interactive panel on click
-    static let expandedWidth: CGFloat = 588
+    static let expandedWidth: CGFloat = 648
     static let expandedHeight: CGFloat = 246
 
     init(appState: AppState) {
@@ -60,6 +60,7 @@ final class NotchWindowController: NSWindowController {
             .environmentObject(appState.inputAudio)
             .environmentObject(appState.perAppMixer)
             .environmentObject(appState.mediaService)
+            .environmentObject(appState.notificationService)
             .environmentObject(appState.vpnService)
             .environmentObject(appState.networkMonitor)
             .environmentObject(appState.timerService)
@@ -114,10 +115,22 @@ final class NotchWindowController: NSWindowController {
                 }
             }
             .store(in: &cancellables)
+
+        appState.notificationService.$isReplying
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] replying in
+                guard let self, let window = self.window else { return }
+                if replying {
+                    window.ignoresMouseEvents = false
+                    NSApp.activate(ignoringOtherApps: true)
+                    window.makeKey()
+                }
+            }
+            .store(in: &cancellables)
     }
 
     private func installMouseMonitors() {
-        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown]) { [weak self] event in
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .leftMouseDragged]) { [weak self] event in
             self?.handleMouseEvent(event)
         }
         localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged]) { [weak self] event in
@@ -126,24 +139,63 @@ final class NotchWindowController: NSWindowController {
         }
     }
 
+    private func isDraggingFileFromFinderOrApp() -> Bool {
+        let dragPB = NSPasteboard(name: .drag)
+        if let types = dragPB.types,
+           types.contains(.fileURL) || types.contains(NSPasteboard.PasteboardType("NSFilenamesPboardType")) {
+            return true
+        }
+        return dragPB.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
+    }
+
     private func handleMouseEvent(_ event: NSEvent) {
         guard let window else { return }
         let mouseLocation = NSEvent.mouseLocation // Screen coordinates (origin bottom-left)
         let frame = window.frame
 
+        // Auto-open Clips -> Files shelf when dragging a file near the top-center notch!
+        if event.type == .leftMouseDragged && isDraggingFileFromFinderOrApp() {
+            let dragTriggerRect = NSRect(
+                x: frame.midX - 240,
+                y: frame.maxY - 120,
+                width: 480,
+                height: 120
+            )
+            if dragTriggerRect.contains(mouseLocation) {
+                collapseWorkItem?.cancel()
+                collapseWorkItem = nil
+                window.ignoresMouseEvents = false
+                if appState.enabledTabs.contains(.clipboard) {
+                    appState.selectedTab = .clipboard
+                    appState.clipboardService.clipsMode = .files
+                }
+                if appState.displayState != .expanded {
+                    appState.setDisplayState(.expanded)
+                }
+                return
+            }
+        }
+
         let state = appState.displayState
+        let hasTimerAlarm = appState.timerService.isAlarmRinging && state != .expanded
+        let hasNotifPopup = (appState.notificationService.activePopup != nil || hasTimerAlarm) && state != .expanded
         let activeW: CGFloat
         let activeH: CGFloat
-        switch state {
-        case .idle:
-            activeW = Self.idleWidth + 28
-            activeH = CGFloat(appState.prefs.idleHeight) + 10
-        case .peek:
-            activeW = Self.peekWidth + 20
-            activeH = Self.peekHeight + 12
-        case .expanded:
-            activeW = Self.expandedWidth + 16
-            activeH = CGFloat(appState.prefs.expandedHeight) + 16
+        if hasNotifPopup {
+            activeW = 410
+            activeH = CGFloat(appState.prefs.idleHeight) + (appState.notificationService.isReplying ? 148 : 112)
+        } else {
+            switch state {
+            case .idle:
+                activeW = Self.idleWidth + 28
+                activeH = CGFloat(appState.prefs.idleHeight) + 10
+            case .peek:
+                activeW = Self.peekWidth + 20
+                activeH = Self.peekHeight + 12
+            case .expanded:
+                activeW = Self.expandedWidth + 16
+                activeH = CGFloat(appState.prefs.expandedHeight) + 16
+            }
         }
 
         let activeRect = NSRect(
@@ -158,6 +210,27 @@ final class NotchWindowController: NSWindowController {
         // Toggle click-through dynamically so windows beneath the transparent area remain clickable
         if window.ignoresMouseEvents == inside {
             window.ignoresMouseEvents = !inside
+        }
+
+        // Track hover over the under-notch notification popup to pause/resume its 3-second auto-dismiss
+        if hasNotifPopup {
+            let popupTopY = frame.maxY - CGFloat(appState.prefs.idleHeight) - 6
+            let popupRect = NSRect(
+                x: frame.midX - 200,
+                y: frame.maxY - activeH,
+                width: 400,
+                height: max(60, activeH - CGFloat(appState.prefs.idleHeight))
+            )
+            let insidePopup = popupRect.contains(mouseLocation) && mouseLocation.y <= popupTopY
+            appState.notificationService.setHovering(insidePopup)
+
+            if event.type == .leftMouseDown && !inside && appState.notificationService.isReplying {
+                appState.notificationService.dismissPopup()
+                return
+            }
+            if insidePopup {
+                return // Don't auto-expand to peek while interacting with the notification popup
+            }
         }
 
         // If user clicked outside while expanded, unpin and collapse back to idle
