@@ -58,6 +58,8 @@ struct NotchPreferences: Codable, Equatable {
     var showVPNDotInIdle: Bool = true
     var showNotificationPopups: Bool = true
     var notificationDuration: Double = 3.0
+    var autoDismissMacBanner: Bool = false
+    var readNotificationDatabase: Bool = true
     var clipboardLimit: Int = 100
     var autoSwitchSystemMic: Bool = true
     var launchAtLogin: Bool = false
@@ -148,6 +150,8 @@ final class AppState: ObservableObject {
         inputAudio.autoSwitchSystemMic = prefs.autoSwitchSystemMic
         notificationService.enabled = prefs.showNotificationPopups
         notificationService.popupDuration = prefs.notificationDuration
+        notificationService.autoDismissMacBanner = prefs.autoDismissMacBanner
+        notificationService.readNotificationDatabase = prefs.readNotificationDatabase
         updateLaunchAgent(enabled: prefs.launchAtLogin)
     }
 

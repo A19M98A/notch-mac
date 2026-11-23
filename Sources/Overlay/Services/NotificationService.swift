@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import ApplicationServices
+import SQLite3
 import Combine
 
 struct CapturedNotification: Identifiable, Equatable {
@@ -31,17 +32,30 @@ final class NotificationService: ObservableObject {
 
     var enabled: Bool = true
     var popupDuration: TimeInterval = 3.0
+    var autoDismissMacBanner: Bool = false
+    var readNotificationDatabase: Bool = true
+
+    @Published var canReadNotificationDB: Bool = false
 
     private var pollTimer: Timer?
     private var dismissWorkItem: DispatchWorkItem?
     private var seenTimestamps: [String: Date] = [:]
     private var liveBannerElements: [UUID: AXUIElement] = [:]
+    private var lastDBRecID: Int64 = -1
     private let maxHistory = 30
 
     init() {
+        checkDatabaseAccess()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.45, repeats: true) { [weak self] _ in
-            self?.scanNotificationCenter()
+            self?.scanAllSources()
         }
+    }
+
+    private func scanAllSources() {
+        if readNotificationDatabase {
+            scanNotificationDatabase()
+        }
+        scanNotificationCenter()
     }
 
     deinit {
@@ -342,7 +356,13 @@ final class NotificationService: ObservableObject {
                         continue
                     }
                     self.seenTimestamps[parsed.dedupeKey] = now
-                    self.showPopup(parsed, axBanner: banner)
+                    if self.autoDismissMacBanner {
+                        // Immediately hide macOS's top-right banner so ONLY NotchPulse displays it
+                        _ = self.pressAXAction(on: banner, matching: ["close", "dismiss", "clear"])
+                        self.showPopup(parsed, axBanner: nil)
+                    } else {
+                        self.showPopup(parsed, axBanner: banner)
+                    }
                     return
                 }
             }
@@ -531,6 +551,156 @@ final class NotificationService: ObservableObject {
             }
         }
         return nil
+    }
+
+    // MARK: - Option 2: Zero-Flash macOS NotificationCenter SQLite DB Reader (Works with DND / Banners OFF)
+
+    func openFullDiskAccessSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    func checkDatabaseAccess() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let readable = self.resolveNotificationDBPath() != nil
+            DispatchQueue.main.async {
+                self.canReadNotificationDB = readable
+            }
+        }
+    }
+
+    private func resolveNotificationDBPath() -> String? {
+        var candidates: [String] = []
+
+        // macOS 15+ / 26+ / 27+ location
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        candidates.append("\(home)/Library/Group Containers/group.com.apple.usernoted/db2/db")
+
+        // macOS 12–14 location via DARWIN_USER_DIR
+        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+        let len = confstr(_CS_DARWIN_USER_DIR, &buf, buf.count)
+        if len > 0 {
+            let userDir = String(cString: buf)
+            candidates.append("\(userDir)com.apple.notificationcenter/db2/db")
+        }
+
+        for path in candidates {
+            if FileManager.default.isReadableFile(atPath: path) {
+                var db: OpaquePointer?
+                if sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK {
+                    sqlite3_close(db)
+                    return path
+                }
+            }
+        }
+        return nil
+    }
+
+    private func scanNotificationDatabase() {
+        guard enabled else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self, let dbPath = self.resolveNotificationDBPath() else {
+                DispatchQueue.main.async { self?.canReadNotificationDB = false }
+                return
+            }
+            if !self.canReadNotificationDB {
+                DispatchQueue.main.async { self.canReadNotificationDB = true }
+            }
+
+            var db: OpaquePointer?
+            guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db else { return }
+            defer { sqlite3_close(db) }
+
+            // On first poll, initialize watermark to current max rec_id so old notifications don't pop up
+            if self.lastDBRecID < 0 {
+                var stmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, "SELECT COALESCE(MAX(rec_id), 0) FROM record", -1, &stmt, nil) == SQLITE_OK {
+                    if sqlite3_step(stmt) == SQLITE_ROW {
+                        self.lastDBRecID = sqlite3_column_int64(stmt, 0)
+                    }
+                    sqlite3_finalize(stmt)
+                }
+                return
+            }
+
+            let sql = """
+            SELECT r.rec_id, a.identifier, r.data
+            FROM record r
+            JOIN app a ON r.app_id = a.app_id
+            WHERE r.rec_id > ?
+            ORDER BY r.rec_id ASC
+            LIMIT 10
+            """
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_int64(stmt, 1, self.lastDBRecID)
+
+            let now = Date()
+            self.seenTimestamps = self.seenTimestamps.filter { now.timeIntervalSince($0.value) < 60 }
+
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let recID = sqlite3_column_int64(stmt, 0)
+                if recID > self.lastDBRecID {
+                    self.lastDBRecID = recID
+                }
+
+                let bundleID = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+                guard let blobPtr = sqlite3_column_blob(stmt, 2) else { continue }
+                let blobLen = Int(sqlite3_column_bytes(stmt, 2))
+                guard blobLen > 0 else { continue }
+                let plistData = Data(bytes: blobPtr, count: blobLen)
+
+                guard let parsed = self.parseNotificationPlist(plistData, bundleID: bundleID) else { continue }
+                if let lastSeen = self.seenTimestamps[parsed.dedupeKey], now.timeIntervalSince(lastSeen) < 15 {
+                    continue
+                }
+                self.seenTimestamps[parsed.dedupeKey] = now
+                self.showPopup(parsed, axBanner: nil)
+            }
+        }
+    }
+
+    private func parseNotificationPlist(_ data: Data, bundleID: String) -> CapturedNotification? {
+        guard let root = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
+            return nil
+        }
+        let req = (root["req"] as? [String: Any]) ?? root
+        let title = (req["titl"] as? String) ?? ""
+        let subtitle = (req["subt"] as? String) ?? ""
+        let body = (req["body"] as? String) ?? ""
+        guard !title.isEmpty || !body.isEmpty else { return nil }
+
+        var appName = bundleID.split(separator: ".").last.map(String.init) ?? "Notification"
+        var appIcon: NSImage? = nil
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            appName = Bundle(url: appURL)?.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+                ?? Bundle(url: appURL)?.object(forInfoDictionaryKey: "CFBundleName") as? String
+                ?? appURL.deletingPathExtension().lastPathComponent
+            appIcon = NSWorkspace.shared.icon(forFile: appURL.path)
+        } else if let running = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleID }) {
+            appName = running.localizedName ?? appName
+            appIcon = running.icon
+        }
+
+        let displayTitle = title.isEmpty ? appName : title
+        let displayBody = body.isEmpty ? subtitle : body
+        let dedupe = "\(appName)|\(displayTitle)|\(displayBody)"
+
+        return CapturedNotification(
+            id: UUID(),
+            dedupeKey: dedupe,
+            appName: appName,
+            bundleID: bundleID,
+            appIcon: appIcon ?? NSImage(systemSymbolName: "bell.badge.fill", accessibilityDescription: nil),
+            title: displayTitle,
+            subtitle: subtitle,
+            body: displayBody,
+            date: Date(),
+            isTest: false
+        )
     }
 
     private func findAppIcon(named name: String) -> NSImage? {

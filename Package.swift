@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 5.9
 import PackageDescription
 
 let package = Package(
@@ -13,16 +13,14 @@ let package = Package(
         .executableTarget(
             name: "Overlay",
             path: "Sources/Overlay",
-            swiftSettings: [
-                .swiftLanguageMode(.v5)
-            ],
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("SwiftUI"),
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("AudioToolbox"),
                 .linkedFramework("AVFoundation"),
-                .linkedFramework("Carbon")
+                .linkedFramework("Carbon"),
+                .linkedLibrary("sqlite3")
             ]
         )
     ]

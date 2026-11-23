@@ -562,20 +562,22 @@ struct NotchRootView: View {
     private var expandedContent: some View {
         VStack(spacing: 12) {
             // Header with Visible Tabs, Settings & Pin Control
-            HStack(spacing: 5) {
+            HStack(spacing: 3) {
                 ForEach(appState.visibleTabs) { tab in
                     Button {
                         withAnimation(.easeInOut(duration: 0.16)) {
                             appState.selectedTab = tab
                         }
                     } label: {
-                        HStack(spacing: 4) {
+                        HStack(spacing: 3) {
                             Image(systemName: tab.sfSymbol)
-                                .font(.system(size: 11, weight: .semibold))
+                                .font(.system(size: 10, weight: .semibold))
                             Text(tab.rawValue)
-                                .font(.system(size: 11, weight: .semibold))
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
                         }
-                        .padding(.horizontal, 8)
+                        .padding(.horizontal, 7)
                         .padding(.vertical, 5)
                         .background(
                             Capsule()
@@ -586,7 +588,7 @@ struct NotchRootView: View {
                     .buttonStyle(.plain)
                 }
 
-                Spacer()
+                Spacer(minLength: 4)
 
                 Button {
                     appState.isPinned = false

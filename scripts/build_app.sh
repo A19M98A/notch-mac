@@ -11,12 +11,19 @@ RELEASE_ZIP="$BUILD_DIR/$APP_NAME-$VERSION-macOS-Universal.zip"
 
 echo "Building $APP_NAME v$VERSION (release universal arm64 + x86_64, macOS 12.0+)..."
 cd "$ROOT_DIR"
-CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-/tmp/clang-module-cache}" swift build -c release --arch arm64 --arch x86_64 --disable-sandbox --scratch-path "$ROOT_DIR/.build"
+export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-/tmp/clang-module-cache}"
 
-BIN_DIR="$(CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-/tmp/clang-module-cache}" swift build -c release --arch arm64 --arch x86_64 --disable-sandbox --scratch-path "$ROOT_DIR/.build" --show-bin-path | tail -n 1)"
-BIN_PATH="$BIN_DIR/$BIN_NAME"
-if [ ! -f "$BIN_PATH" ]; then
-    echo "Error: Binary not found at $BIN_PATH"
+# Build arm64 and x86_64 into separate scratch paths and combine with lipo (avoids Xcode 16 XCBuild universal bug)
+swift build -c release --arch arm64 --disable-sandbox --scratch-path "$ROOT_DIR/.build/arm64"
+ARM64_DIR="$(swift build -c release --arch arm64 --disable-sandbox --scratch-path "$ROOT_DIR/.build/arm64" --show-bin-path | tail -n 1)"
+ARM64_BIN="$ARM64_DIR/$BIN_NAME"
+
+swift build -c release --arch x86_64 --disable-sandbox --scratch-path "$ROOT_DIR/.build/x86_64"
+X86_DIR="$(swift build -c release --arch x86_64 --disable-sandbox --scratch-path "$ROOT_DIR/.build/x86_64" --show-bin-path | tail -n 1)"
+X86_BIN="$X86_DIR/$BIN_NAME"
+
+if [ ! -f "$ARM64_BIN" ] || [ ! -f "$X86_BIN" ]; then
+    echo "Error: One or both architecture binaries missing ($ARM64_BIN, $X86_BIN)"
     exit 1
 fi
 
@@ -25,7 +32,7 @@ rm -rf "$APP_BUNDLE" "$RELEASE_ZIP"
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
-cp "$BIN_PATH" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+lipo -create -output "$APP_BUNDLE/Contents/MacOS/$APP_NAME" "$ARM64_BIN" "$X86_BIN"
 chmod +x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
 cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST

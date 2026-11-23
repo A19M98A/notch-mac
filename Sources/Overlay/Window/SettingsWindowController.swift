@@ -304,6 +304,14 @@ struct NotchSettingsView: View {
                             ),
                             range: 2...8
                         )
+                        toggleRow("Auto-Hide macOS Top-Right Banner", isOn: Binding(
+                            get: { appState.prefs.autoDismissMacBanner },
+                            set: { v in appState.updatePreferences { $0.autoDismissMacBanner = v } }
+                        ))
+                        toggleRow("Zero-Flash DB Mode (works with DND / Banners Off)", isOn: Binding(
+                            get: { appState.prefs.readNotificationDatabase },
+                            set: { v in appState.updatePreferences { $0.readNotificationDatabase = v } }
+                        ))
                     }
                     toggleRow("Show Network Speed on Hover", isOn: Binding(
                         get: { appState.prefs.showNetworkSpeedOnHover },
@@ -401,6 +409,15 @@ struct NotchSettingsView: View {
                         .foregroundStyle(.white)
                     }
                     .buttonStyle(.plain)
+                }
+
+                permissionRow(
+                    title: "Notification DB (Zero-Flash Mode)",
+                    detail: appState.notificationService.canReadNotificationDB ? "Reading macOS NotificationCenter DB directly" : "Grant Full Disk Access to read notifications with DND/Banners Off",
+                    ok: appState.notificationService.canReadNotificationDB,
+                    actionTitle: appState.notificationService.canReadNotificationDB ? "Ready" : "Open Settings"
+                ) {
+                    appState.notificationService.openFullDiskAccessSettings()
                 }
 
                 permissionRow(
@@ -620,6 +637,7 @@ struct NotchSettingsView: View {
     private func refreshPermissions() {
         axTrusted = AXIsProcessTrusted()
         micGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        appState.notificationService.checkDatabaseAccess()
         inputAudio.refreshAll()
         vpnService.refresh()
     }
