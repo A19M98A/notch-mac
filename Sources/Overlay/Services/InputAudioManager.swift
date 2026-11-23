@@ -632,23 +632,23 @@ final class InputAudioManager: ObservableObject {
             guard !self.isMuted, (self.monitorEnabled || self.routedToVirtualSuccessfully) else { return }
 
             // Fast lossless path when sample rates match (zero resampling artifacts!)
+            // Always center microphone voice to exact dual-mono (identical Left & Right)
             if abs(buffer.format.sampleRate - stereoFormat.sampleRate) < 1.0 {
                 let leftPtr = rawChannels[0]
-                var rightPtr = buffer.format.channelCount >= 2 ? rawChannels[1] : rawChannels[0]
-
-                // Center single-channel 2ch interfaces (e.g. mic only on Left)
                 if buffer.format.channelCount >= 2 {
+                    let rightPtr = rawChannels[1]
                     var sumL: Float = 0
                     var sumR: Float = 0
                     for i in stride(from: 0, to: n, by: 4) {
                         sumL += abs(leftPtr[i])
                         sumR += abs(rightPtr[i])
                     }
-                    if sumL > 0.0001 && sumR < sumL * 0.15 {
-                        rightPtr = leftPtr
-                    }
+                    // Pick the active mic channel and mirror identically to both L and R
+                    let monoPtr = (sumR > sumL * 1.2) ? rightPtr : leftPtr
+                    ring.write(leftSrc: monoPtr, rightSrc: monoPtr, count: n)
+                } else {
+                    ring.write(leftSrc: leftPtr, rightSrc: leftPtr, count: n)
                 }
-                ring.write(leftSrc: leftPtr, rightSrc: rightPtr, count: n)
                 return
             }
 
@@ -681,9 +681,8 @@ final class InputAudioManager: ObservableObject {
                outBuf.frameLength > 0,
                let dstCh = outBuf.floatChannelData {
                 let outCount = Int(outBuf.frameLength)
-                let lPtr = dstCh[0]
-                let rPtr = buffer.format.channelCount == 1 ? dstCh[0] : dstCh[1]
-                ring.write(leftSrc: lPtr, rightSrc: rPtr, count: outCount)
+                // Mirror channel 0 identically to both Left and Right for 100% centered dual-mono voice
+                ring.write(leftSrc: dstCh[0], rightSrc: dstCh[0], count: outCount)
             }
         }
 
