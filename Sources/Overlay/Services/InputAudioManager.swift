@@ -550,6 +550,9 @@ final class InputAudioManager: ObservableObject {
             guard !self.isMuted, (self.monitorEnabled || self.routedToVirtualSuccessfully) else { return }
 
             guard let converter = AVAudioConverter(from: buffer.format, to: stereoFormat) else { return }
+            if buffer.format.channelCount == 1 {
+                converter.channelMap = [0, 0]
+            }
             let ratio = stereoFormat.sampleRate / max(1.0, buffer.format.sampleRate)
             let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
             guard let outBuf = AVAudioPCMBuffer(pcmFormat: stereoFormat, frameCapacity: capacity) else { return }
@@ -567,6 +570,27 @@ final class InputAudioManager: ObservableObject {
             }
 
             if (status == .haveData || status == .inputRanDry) && outBuf.frameLength > 0 {
+                // Ensure centered dual-mono stereo (handles mono mics and 2ch interfaces with mic on Left/Ch1 only)
+                if let channels = outBuf.floatChannelData, outBuf.format.channelCount >= 2 {
+                    let count = Int(outBuf.frameLength)
+                    let left = channels[0]
+                    let right = channels[1]
+                    if buffer.format.channelCount == 1 {
+                        memcpy(right, left, count * MemoryLayout<Float>.size)
+                    } else {
+                        var sumL: Float = 0
+                        var sumR: Float = 0
+                        for i in stride(from: 0, to: count, by: 4) {
+                            sumL += abs(left[i])
+                            sumR += abs(right[i])
+                        }
+                        if sumL > 0.0001 && sumR < sumL * 0.15 {
+                            memcpy(right, left, count * MemoryLayout<Float>.size)
+                        } else if sumR > 0.0001 && sumL < sumR * 0.15 {
+                            memcpy(left, right, count * MemoryLayout<Float>.size)
+                        }
+                    }
+                }
                 player.scheduleBuffer(outBuf, completionHandler: nil)
             }
         }
