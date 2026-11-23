@@ -57,6 +57,76 @@ enum VoiceEffectPreset: String, CaseIterable, Identifiable {
     }
 }
 
+/// Thread-safe stereo audio ring buffer for glitch-free, zero-crackle bridging between
+/// hardware capture and real-time AVAudioSourceNode playback.
+private final class StereoRingBuffer {
+    private let capacity: Int
+    private var left: [Float]
+    private var right: [Float]
+    private var readIndex: Int = 0
+    private var writeIndex: Int = 0
+    private var available: Int = 0
+    private var primed: Bool = false
+    private let preRollFrames: Int
+    private let lock = NSLock()
+
+    init(capacity: Int = 32768, preRollFrames: Int = 1536) {
+        self.capacity = capacity
+        self.preRollFrames = preRollFrames
+        self.left = [Float](repeating: 0, count: capacity)
+        self.right = [Float](repeating: 0, count: capacity)
+    }
+
+    func reset() {
+        lock.lock()
+        readIndex = 0
+        writeIndex = 0
+        available = 0
+        primed = false
+        lock.unlock()
+    }
+
+    func write(leftSrc: UnsafePointer<Float>, rightSrc: UnsafePointer<Float>, count: Int) {
+        guard count > 0 else { return }
+        lock.lock()
+        // If consumer fell way behind, drop oldest frames smoothly to keep latency low
+        if available + count > capacity {
+            let drop = (available + count) - capacity
+            readIndex = (readIndex + drop) % capacity
+            available -= drop
+        }
+        for i in 0..<count {
+            left[writeIndex] = leftSrc[i]
+            right[writeIndex] = rightSrc[i]
+            writeIndex = (writeIndex + 1) % capacity
+        }
+        available += count
+        if !primed && available >= preRollFrames {
+            primed = true
+        }
+        lock.unlock()
+    }
+
+    func read(leftDst: UnsafeMutablePointer<Float>, rightDst: UnsafeMutablePointer<Float>, count: Int) {
+        lock.lock()
+        if !primed || available < count {
+            // Output smooth silence while priming or on underrun (no garbage / pops)
+            memset(leftDst, 0, count * MemoryLayout<Float>.size)
+            memset(rightDst, 0, count * MemoryLayout<Float>.size)
+            if available < count { primed = false }
+            lock.unlock()
+            return
+        }
+        for i in 0..<count {
+            leftDst[i] = left[readIndex]
+            rightDst[i] = right[readIndex]
+            readIndex = (readIndex + 1) % capacity
+        }
+        available -= count
+        lock.unlock()
+    }
+}
+
 /// Manages macOS audio input devices (selection, gain, mute) plus a real-time AVAudioEngine DSP
 /// voice effects chain (EQ / Voice Clarity, Pitch Shift, Delay, Reverb, Distortion, Live VU Meter).
 final class InputAudioManager: ObservableObject {
@@ -82,8 +152,8 @@ final class InputAudioManager: ObservableObject {
     private var captureEngine: AVAudioEngine?
     private var fxEngine: AVAudioEngine?
     private var monitorEngine: AVAudioEngine?
-    private var monitorPlayerNode: AVAudioPlayerNode?
-    private var playerNode: AVAudioPlayerNode?
+    private var fxRingBuffer: StereoRingBuffer?
+    private var monitorRingBuffer: StereoRingBuffer?
     private var eqNode: AVAudioUnitEQ?
     private var pitchNode: AVAudioUnitTimePitch?
     private var distortionNode: AVAudioUnitDistortion?
@@ -262,7 +332,6 @@ final class InputAudioManager: ObservableObject {
     private func updateOutputVolume() {
         let audible = monitorEnabled || routedToVirtualSuccessfully
         let vol: Float = audible ? 1.0 : 0.0
-        playerNode?.volume = vol
         fxEngine?.mainMixerNode.outputVolume = vol
     }
     func toggleFXEngine() {
@@ -487,28 +556,41 @@ final class InputAudioManager: ObservableObject {
             return
         }
 
-        let player = AVAudioPlayerNode()
+        let ring = StereoRingBuffer(capacity: 32768, preRollFrames: 1536)
+        self.fxRingBuffer = ring
+
+        let sourceNode = AVAudioSourceNode(format: stereoFormat) { _, _, frameCount, audioBufferList -> OSStatus in
+            let abl = UnsafeMutableAudioBufferListPointer(audioBufferList)
+            let n = Int(frameCount)
+            guard abl.count >= 2,
+                  let lPtr = abl[0].mData?.assumingMemoryBound(to: Float.self),
+                  let rPtr = abl[1].mData?.assumingMemoryBound(to: Float.self) else {
+                return noErr
+            }
+            ring.read(leftDst: lPtr, rightDst: rPtr, count: n)
+            return noErr
+        }
+
         let eq = AVAudioUnitEQ(numberOfBands: 3)
         let pitch = AVAudioUnitTimePitch()
         let dist = AVAudioUnitDistortion()
         let delay = AVAudioUnitDelay()
         let reverb = AVAudioUnitReverb()
 
-        self.playerNode = player
         self.eqNode = eq
         self.pitchNode = pitch
         self.distortionNode = dist
         self.delayNode = delay
         self.reverbNode = reverb
 
-        outEngine.attach(player)
+        outEngine.attach(sourceNode)
         outEngine.attach(eq)
         outEngine.attach(pitch)
         outEngine.attach(dist)
         outEngine.attach(delay)
         outEngine.attach(reverb)
 
-        outEngine.connect(player, to: eq, format: stereoFormat)
+        outEngine.connect(sourceNode, to: eq, format: stereoFormat)
         outEngine.connect(eq, to: pitch, format: stereoFormat)
         outEngine.connect(pitch, to: dist, format: stereoFormat)
         outEngine.connect(dist, to: delay, format: stereoFormat)
@@ -516,45 +598,71 @@ final class InputAudioManager: ObservableObject {
         outEngine.connect(reverb, to: outEngine.mainMixerNode, format: stereoFormat)
 
         let initialVol: Float = (monitorEnabled || didRouteVirtual) ? 1.0 : 0.0
-        player.volume = initialVol
         outEngine.mainMixerNode.outputVolume = initialVol
 
         updateDSPParameters()
 
+        // Create ONE persistent converter (reused across callbacks to prevent periodic filter-reset crackle!)
+        var cachedConverter: AVAudioConverter? = nil
+        var cachedSrcFormat: AVAudioFormat? = nil
         self.isEngineActive = true
 
-        // 4. Tap with format: nil so AVAudioEngine always delivers real hardware mic buffers
-        inNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self, weak player] buffer, _ in
-            guard let self, self.isEngineActive, let player else { return }
+        // Capture-only tap on inputNode: computes VU level + feeds smooth ring buffer
+        inNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buffer, _ in
+            guard let self, self.isEngineActive else { return }
+            let n = Int(buffer.frameLength)
+            guard n > 0, let rawChannels = buffer.floatChannelData else { return }
 
-            // Live VU meter from raw mic input
-            if let chData = buffer.floatChannelData?[0] {
-                let n = Int(buffer.frameLength)
-                if n > 0 {
-                    var sum: Float = 0
-                    for i in 0..<n {
-                        let s = chData[i]
-                        sum += s * s
-                    }
-                    let rms = sqrt(sum / Float(n))
-                    let level = min(1.0, max(0.0, rms * 8.0))
-                    DispatchQueue.main.async {
-                        if self.isEngineActive {
-                            self.liveLevel = level
-                        }
-                    }
+            // 1. Live VU meter from raw mic input
+            let ch0 = rawChannels[0]
+            var sum: Float = 0
+            for i in 0..<n {
+                let s = ch0[i]
+                sum += s * s
+            }
+            let rms = sqrt(sum / Float(n))
+            let level = min(1.0, max(0.0, rms * 8.0))
+            DispatchQueue.main.async {
+                if self.isEngineActive {
+                    self.liveLevel = level
                 }
             }
 
-            // Skip playback scheduling when muted or neither Monitor nor Virtual Mic is active
+            // 2. Skip audio feed when muted or neither Monitor nor Virtual Mic is active
             guard !self.isMuted, (self.monitorEnabled || self.routedToVirtualSuccessfully) else { return }
 
-            guard let converter = AVAudioConverter(from: buffer.format, to: stereoFormat) else { return }
-            if buffer.format.channelCount == 1 {
-                converter.channelMap = [0, 0]
+            // Fast lossless path when sample rates match (zero resampling artifacts!)
+            if abs(buffer.format.sampleRate - stereoFormat.sampleRate) < 1.0 {
+                let leftPtr = rawChannels[0]
+                var rightPtr = buffer.format.channelCount >= 2 ? rawChannels[1] : rawChannels[0]
+
+                // Center single-channel 2ch interfaces (e.g. mic only on Left)
+                if buffer.format.channelCount >= 2 {
+                    var sumL: Float = 0
+                    var sumR: Float = 0
+                    for i in stride(from: 0, to: n, by: 4) {
+                        sumL += abs(leftPtr[i])
+                        sumR += abs(rightPtr[i])
+                    }
+                    if sumL > 0.0001 && sumR < sumL * 0.15 {
+                        rightPtr = leftPtr
+                    }
+                }
+                ring.write(leftSrc: leftPtr, rightSrc: rightPtr, count: n)
+                return
             }
+
+            // Resampling path using a single persistent AVAudioConverter
+            if cachedConverter == nil || cachedSrcFormat != buffer.format {
+                cachedSrcFormat = buffer.format
+                cachedConverter = AVAudioConverter(from: buffer.format, to: stereoFormat)
+                if buffer.format.channelCount == 1 {
+                    cachedConverter?.channelMap = [0, 0]
+                }
+            }
+            guard let converter = cachedConverter else { return }
             let ratio = stereoFormat.sampleRate / max(1.0, buffer.format.sampleRate)
-            let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
+            let capacity = AVAudioFrameCount(Double(n) * ratio) + 64
             guard let outBuf = AVAudioPCMBuffer(pcmFormat: stereoFormat, frameCapacity: capacity) else { return }
 
             var fed = false
@@ -569,35 +677,18 @@ final class InputAudioManager: ObservableObject {
                 return buffer
             }
 
-            if (status == .haveData || status == .inputRanDry) && outBuf.frameLength > 0 {
-                // Ensure centered dual-mono stereo (handles mono mics and 2ch interfaces with mic on Left/Ch1 only)
-                if let channels = outBuf.floatChannelData, outBuf.format.channelCount >= 2 {
-                    let count = Int(outBuf.frameLength)
-                    let left = channels[0]
-                    let right = channels[1]
-                    if buffer.format.channelCount == 1 {
-                        memcpy(right, left, count * MemoryLayout<Float>.size)
-                    } else {
-                        var sumL: Float = 0
-                        var sumR: Float = 0
-                        for i in stride(from: 0, to: count, by: 4) {
-                            sumL += abs(left[i])
-                            sumR += abs(right[i])
-                        }
-                        if sumL > 0.0001 && sumR < sumL * 0.15 {
-                            memcpy(right, left, count * MemoryLayout<Float>.size)
-                        } else if sumR > 0.0001 && sumL < sumR * 0.15 {
-                            memcpy(left, right, count * MemoryLayout<Float>.size)
-                        }
-                    }
-                }
-                player.scheduleBuffer(outBuf, completionHandler: nil)
+            if (status == .haveData || status == .inputRanDry),
+               outBuf.frameLength > 0,
+               let dstCh = outBuf.floatChannelData {
+                let outCount = Int(outBuf.frameLength)
+                let lPtr = dstCh[0]
+                let rPtr = buffer.format.channelCount == 1 ? dstCh[0] : dstCh[1]
+                ring.write(leftSrc: lPtr, rightSrc: rPtr, count: outCount)
             }
         }
 
         do {
             try outEngine.start()
-            player.play()
             try capEngine.start()
             self.captureEngine = capEngine
             self.fxEngine = outEngine
@@ -653,33 +744,37 @@ final class InputAudioManager: ObservableObject {
         stopMonitorEngine()
 
         let monEngine = AVAudioEngine()
-        let monPlayer = AVAudioPlayerNode()
         let fxFormat = fx.mainMixerNode.outputFormat(forBus: 0)
-        guard fxFormat.sampleRate > 0, fxFormat.channelCount > 0 else { return }
+        guard fxFormat.sampleRate > 0, fxFormat.channelCount >= 2 else { return }
 
-        monEngine.attach(monPlayer)
-        monEngine.connect(monPlayer, to: monEngine.mainMixerNode, format: fxFormat)
+        let monRing = StereoRingBuffer(capacity: 32768, preRollFrames: 1536)
+        self.monitorRingBuffer = monRing
+
+        let monSource = AVAudioSourceNode(format: fxFormat) { _, _, frameCount, audioBufferList -> OSStatus in
+            let abl = UnsafeMutableAudioBufferListPointer(audioBufferList)
+            let n = Int(frameCount)
+            guard abl.count >= 2,
+                  let lPtr = abl[0].mData?.assumingMemoryBound(to: Float.self),
+                  let rPtr = abl[1].mData?.assumingMemoryBound(to: Float.self) else {
+                return noErr
+            }
+            monRing.read(leftDst: lPtr, rightDst: rPtr, count: n)
+            return noErr
+        }
+
+        monEngine.attach(monSource)
+        monEngine.connect(monSource, to: monEngine.mainMixerNode, format: fxFormat)
         monEngine.mainMixerNode.outputVolume = 1.0
 
         do {
             try monEngine.start()
-            monPlayer.play()
             self.monitorEngine = monEngine
-            self.monitorPlayerNode = monPlayer
 
             fx.mainMixerNode.removeTap(onBus: 0)
-            fx.mainMixerNode.installTap(onBus: 0, bufferSize: 1024, format: fxFormat) { [weak self, weak monPlayer] buf, _ in
-                guard let self, self.monitorEnabled, self.isEngineActive, let monPlayer else { return }
-                guard let copy = AVAudioPCMBuffer(pcmFormat: buf.format, frameCapacity: buf.frameLength) else { return }
-                copy.frameLength = buf.frameLength
-                if let src = buf.floatChannelData, let dst = copy.floatChannelData {
-                    let channels = Int(buf.format.channelCount)
-                    let bytes = Int(buf.frameLength) * MemoryLayout<Float>.size
-                    for ch in 0..<channels {
-                        memcpy(dst[ch], src[ch], bytes)
-                    }
-                }
-                monPlayer.scheduleBuffer(copy, completionHandler: nil)
+            fx.mainMixerNode.installTap(onBus: 0, bufferSize: 1024, format: fxFormat) { [weak self] buf, _ in
+                guard let self, self.monitorEnabled, self.isEngineActive,
+                      let ch = buf.floatChannelData, buf.frameLength > 0 else { return }
+                monRing.write(leftSrc: ch[0], rightSrc: ch[1], count: Int(buf.frameLength))
             }
         } catch {
             stopMonitorEngine()
@@ -688,9 +783,8 @@ final class InputAudioManager: ObservableObject {
 
     private func stopMonitorEngine() {
         fxEngine?.mainMixerNode.removeTap(onBus: 0)
-        monitorPlayerNode?.volume = 0
-        monitorPlayerNode?.stop()
-        monitorPlayerNode = nil
+        monitorRingBuffer?.reset()
+        monitorRingBuffer = nil
         monitorEngine?.stop()
         monitorEngine?.reset()
         monitorEngine = nil
@@ -700,15 +794,14 @@ final class InputAudioManager: ObservableObject {
         isEngineActive = false
         stopMonitorEngine()
         routedToVirtualSuccessfully = false
+        fxRingBuffer?.reset()
+        fxRingBuffer = nil
         if let cap = captureEngine {
             cap.inputNode.removeTap(onBus: 0)
             cap.stop()
             cap.reset()
             captureEngine = nil
         }
-        playerNode?.volume = 0.0
-        playerNode?.stop()
-        playerNode = nil
         if let fx = fxEngine {
             fx.mainMixerNode.outputVolume = 0.0
             fx.stop()
