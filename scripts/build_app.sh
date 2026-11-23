@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BIN_NAME="Overlay"
 APP_NAME="NotchPulse"
-VERSION="1.0.0"
+VERSION="1.1.0"
 BUILD_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 RELEASE_ZIP="$BUILD_DIR/$APP_NAME-$VERSION-macOS-Universal.zip"

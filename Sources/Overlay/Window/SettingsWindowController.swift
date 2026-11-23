@@ -498,7 +498,7 @@ struct NotchSettingsView: View {
                 Text("NotchPulse")
                     .font(.system(size: 22, weight: .bold))
                     .foregroundStyle(.white)
-                Text("Version 1.0.0 · Universal (Apple Silicon & Intel) · macOS 12+")
+                Text("Version 1.1.0 · Universal (Apple Silicon & Intel) · macOS 12+")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.55))
             }
