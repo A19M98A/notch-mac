@@ -4,6 +4,7 @@ struct NotchRootView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var systemAudio: SystemAudioManager
     @EnvironmentObject var pairPlay: PairPlayService
+    @EnvironmentObject var virtualMic: VirtualMicService
     @EnvironmentObject var mediaService: MediaRemoteService
     @EnvironmentObject var notificationService: NotificationService
     @EnvironmentObject var vpnService: VPNService
@@ -392,13 +393,19 @@ struct NotchRootView: View {
                     .frame(width: 5, height: 5)
             }
 
+            if virtualMic.isActive {
+                Circle()
+                    .fill(Color.mint)
+                    .frame(width: 5, height: 5)
+            }
+
             if timerService.isActiveInNotch {
                 Circle()
                     .fill(Color.orange)
                     .frame(width: 5, height: 5)
             }
 
-            if !(appState.prefs.showVPNDotInIdle && vpnService.liveStatus.connected) && !mediaService.track.isPlaying && !timerService.isActiveInNotch && !pairPlay.isActive {
+            if !(appState.prefs.showVPNDotInIdle && vpnService.liveStatus.connected) && !mediaService.track.isPlaying && !timerService.isActiveInNotch && !pairPlay.isActive && !virtualMic.isActive {
                 Capsule()
                     .fill(Color.white.opacity(0.28))
                     .frame(width: 24, height: 3)
@@ -540,6 +547,12 @@ struct NotchRootView: View {
                         Image(systemName: "person.2.wave.2.fill")
                             .font(.system(size: 10.5, weight: .semibold))
                             .foregroundStyle(.cyan)
+                    }
+
+                    if virtualMic.isActive {
+                        Image(systemName: "mic.and.signal.meter.fill")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(.mint)
                     }
 
                     if timerService.isActiveInNotch {

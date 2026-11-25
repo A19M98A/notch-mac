@@ -1,12 +1,43 @@
 import AppKit
 import SwiftUI
 
+enum PairPlayStudioSection: String, CaseIterable, Identifiable {
+    case multiOutput = "Multi-Output"
+    case virtualMicMix = "Virtual Mic Mix"
+    case appRouter = "App Router"
+    case latencySync = "Latency Sync"
+    case voiceFX = "Voice FX"
+
+    var id: String { rawValue }
+
+    var icon: String {
+        switch self {
+        case .multiOutput: return "person.2.wave.2.fill"
+        case .virtualMicMix: return "mic.and.signal.meter.fill"
+        case .appRouter: return "arrow.triangle.branch"
+        case .latencySync: return "metronome.fill"
+        case .voiceFX: return "waveform.badge.mic"
+        }
+    }
+}
+
+final class StudioNavigationModel: ObservableObject {
+    @Published var section: PairPlayStudioSection = .multiOutput
+}
+
 final class PairPlayWindowController: NSWindowController {
     private static var shared: PairPlayWindowController?
+    private static let navModel = StudioNavigationModel()
 
-    static func show(appState: AppState) {
+    static func show(appState: AppState, initialSection: PairPlayStudioSection? = nil) {
         appState.systemAudio.refreshAll()
+        appState.inputAudio.refreshAll()
         appState.perAppMixer.refreshAudioProcesses()
+        appState.virtualMicService.syncDevices()
+
+        if let sec = initialSection {
+            navModel.section = sec
+        }
 
         if let existing = shared, let window = existing.window {
             NSApp.activate(ignoringOtherApps: true)
@@ -23,7 +54,7 @@ final class PairPlayWindowController: NSWindowController {
 
     private init(appState: AppState) {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 580, height: 540),
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 560),
             styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -38,15 +69,16 @@ final class PairPlayWindowController: NSWindowController {
         window.center()
         window.isReleasedWhenClosed = false
 
-        let root = PairPlayStudioView()
+        let root = PairPlayStudioView(nav: Self.navModel)
             .environmentObject(appState)
             .environmentObject(appState.systemAudio)
             .environmentObject(appState.pairPlayService)
+            .environmentObject(appState.virtualMicService)
             .environmentObject(appState.perAppMixer)
             .environmentObject(appState.inputAudio)
 
         let hosting = NSHostingView(rootView: root)
-        hosting.frame = NSRect(x: 0, y: 0, width: 580, height: 540)
+        hosting.frame = NSRect(x: 0, y: 0, width: 620, height: 560)
         hosting.autoresizingMask = [.width, .height]
         window.contentView = hosting
         super.init(window: window)
@@ -57,32 +89,15 @@ final class PairPlayWindowController: NSWindowController {
     }
 }
 
-private enum PairPlayStudioSection: String, CaseIterable, Identifiable {
-    case multiOutput = "Multi-Output"
-    case appRouter = "App Router"
-    case latencySync = "Latency Sync"
-    case voiceFX = "Mic & Voice FX"
-
-    var id: String { rawValue }
-
-    var icon: String {
-        switch self {
-        case .multiOutput: return "person.2.wave.2.fill"
-        case .appRouter: return "arrow.triangle.branch"
-        case .latencySync: return "metronome.fill"
-        case .voiceFX: return "waveform.badge.mic"
-        }
-    }
-}
-
 struct PairPlayStudioView: View {
+    @ObservedObject var nav: StudioNavigationModel
+
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var systemAudio: SystemAudioManager
     @EnvironmentObject var pairPlay: PairPlayService
+    @EnvironmentObject var virtualMic: VirtualMicService
     @EnvironmentObject var perAppMixer: PerAppAudioMixer
     @EnvironmentObject var inputAudio: InputAudioManager
-
-    @State private var section: PairPlayStudioSection = .multiOutput
 
     private var pairableDevices: [AudioOutputDevice] {
         pairPlay.pairableDevices(from: systemAudio.outputDevices)
@@ -114,7 +129,7 @@ struct PairPlayStudioView: View {
                 studioHeaderSection
                     .padding(.horizontal, 18)
 
-                if let msg = pairPlay.statusMessage {
+                if let msg = activeBannerMessage {
                     statusBanner(msg)
                         .padding(.horizontal, 18)
                 }
@@ -131,54 +146,39 @@ struct PairPlayStudioView: View {
         .preferredColorScheme(.dark)
     }
 
+    private var activeBannerMessage: String? {
+        nav.section == .virtualMicMix ? virtualMic.statusMessage : pairPlay.statusMessage
+    }
+
     // MARK: - Header & Navigation
 
     private var studioHeaderSection: some View {
-        let canStart = pairPlay.isActive || selectedConnectedCount >= 2
-        let actionBg: Color = pairPlay.isActive ? .green : (selectedConnectedCount >= 2 ? .cyan : Color.white.opacity(0.12))
-        let actionFg: Color = canStart ? .black : Color.white.opacity(0.45)
-
-        return VStack(spacing: 10) {
+        VStack(spacing: 10) {
             HStack {
                 HStack(spacing: 8) {
-                    Image(systemName: "person.2.wave.2.fill")
+                    Image(systemName: nav.section == .virtualMicMix ? "mic.and.signal.meter.fill" : "person.2.wave.2.fill")
                         .font(.system(size: 16, weight: .bold))
-                        .foregroundColor(.cyan)
-                    Text("PairPlay Audio Studio")
+                        .foregroundColor(nav.section == .virtualMicMix ? .mint : .cyan)
+                    Text("NotchPulse Audio Studio")
                         .font(.system(size: 15, weight: .bold))
                         .foregroundColor(.white)
                     if pairPlay.isActive {
-                        Text("LIVE · \(selectedConnectedCount) OUTPUTS")
-                            .font(.system(size: 9.5, weight: .heavy))
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 3)
-                            .background(Capsule().fill(Color.green.opacity(0.22)))
-                            .foregroundColor(.green)
+                        liveBadge(text: "PAIRPLAY · \(selectedConnectedCount)", color: .cyan)
+                    }
+                    if virtualMic.isActive {
+                        liveBadge(text: "MICMIX LIVE", color: .mint)
                     }
                 }
 
                 Spacer()
 
-                Button {
-                    pairPlay.togglePairPlay()
-                } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: pairPlay.isActive ? "stop.fill" : "play.fill")
-                            .font(.system(size: 10, weight: .bold))
-                        Text(pairPlay.isActive ? "Stop PairPlay" : "Start PairPlay (\(selectedConnectedCount))")
-                            .font(.system(size: 11, weight: .bold))
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(Capsule().fill(actionBg))
-                    .foregroundColor(actionFg)
-                }
-                .buttonStyle(.plain)
-                .disabled(!canStart)
+                headerPrimaryActionButton
 
                 Button {
                     systemAudio.refreshAll()
+                    inputAudio.refreshAll()
                     perAppMixer.refreshAudioProcesses()
+                    virtualMic.syncDevices()
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 12, weight: .semibold))
@@ -189,7 +189,7 @@ struct PairPlayStudioView: View {
                 .buttonStyle(.plain)
             }
 
-            HStack(spacing: 6) {
+            HStack(spacing: 5) {
                 ForEach(PairPlayStudioSection.allCases) { sec in
                     sectionTabPill(sec)
                 }
@@ -198,25 +198,84 @@ struct PairPlayStudioView: View {
         }
     }
 
+    private func liveBadge(text: String, color: Color) -> some View {
+        Text(text)
+            .font(.system(size: 9, weight: .heavy))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(color.opacity(0.20)))
+            .foregroundColor(color)
+    }
+
+    @ViewBuilder
+    private var headerPrimaryActionButton: some View {
+        if nav.section == .virtualMicMix {
+            let count = virtualMic.totalSelectedSourcesCount
+            let canRun = virtualMic.isActive || count >= 1
+            let bg: Color = virtualMic.isActive ? .green : (count >= 1 ? .mint : Color.white.opacity(0.12))
+            let fg: Color = canRun ? .black : Color.white.opacity(0.45)
+            Button {
+                virtualMic.toggleMix()
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: virtualMic.isActive ? "stop.fill" : "play.fill")
+                        .font(.system(size: 10, weight: .bold))
+                    Text(virtualMic.isActive ? "Stop Virtual Mic" : "Start Virtual Mic (\(count))")
+                        .font(.system(size: 11, weight: .bold))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Capsule().fill(bg))
+                .foregroundColor(fg)
+            }
+            .buttonStyle(.plain)
+            .disabled(!canRun)
+        } else {
+            let canStart = pairPlay.isActive || selectedConnectedCount >= 2
+            let bg: Color = pairPlay.isActive ? .green : (selectedConnectedCount >= 2 ? .cyan : Color.white.opacity(0.12))
+            let fg: Color = canStart ? .black : Color.white.opacity(0.45)
+            Button {
+                pairPlay.togglePairPlay()
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: pairPlay.isActive ? "stop.fill" : "play.fill")
+                        .font(.system(size: 10, weight: .bold))
+                    Text(pairPlay.isActive ? "Stop PairPlay" : "Start PairPlay (\(selectedConnectedCount))")
+                        .font(.system(size: 11, weight: .bold))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Capsule().fill(bg))
+                .foregroundColor(fg)
+            }
+            .buttonStyle(.plain)
+            .disabled(!canStart)
+        }
+    }
+
     private func sectionTabPill(_ sec: PairPlayStudioSection) -> some View {
-        let isSelected = section == sec
-        let bg: Color = isSelected ? Color.cyan.opacity(0.22) : .clear
-        let stroke: Color = isSelected ? Color.cyan.opacity(0.55) : .clear
-        let fg: Color = isSelected ? .cyan : Color.white.opacity(0.6)
+        let isSelected = nav.section == sec
+        let accent: Color = sec == .virtualMicMix ? .mint : .cyan
+        let bg: Color = isSelected ? accent.opacity(0.22) : .clear
+        let stroke: Color = isSelected ? accent.opacity(0.55) : .clear
+        let fg: Color = isSelected ? accent : Color.white.opacity(0.6)
 
         return Button {
             withAnimation(.easeInOut(duration: 0.15)) {
-                section = sec
+                nav.section = sec
             }
-            if sec == .appRouter { perAppMixer.refreshAudioProcesses() }
+            if sec == .appRouter || sec == .virtualMicMix {
+                perAppMixer.refreshAudioProcesses()
+                virtualMic.syncDevices()
+            }
         } label: {
-            HStack(spacing: 5) {
+            HStack(spacing: 4) {
                 Image(systemName: sec.icon)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 10.5, weight: .semibold))
                 Text(sec.rawValue)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 10.5, weight: .semibold))
             }
-            .padding(.horizontal, 11)
+            .padding(.horizontal, 10)
             .padding(.vertical, 6)
             .background(Capsule().fill(bg))
             .overlay(Capsule().stroke(stroke, lineWidth: 1))
@@ -242,9 +301,11 @@ struct PairPlayStudioView: View {
 
     @ViewBuilder
     private var sectionContent: some View {
-        switch section {
+        switch nav.section {
         case .multiOutput:
             multiOutputSection
+        case .virtualMicMix:
+            virtualMicMixSection
         case .appRouter:
             appRouterSection
         case .latencySync:
@@ -440,7 +501,399 @@ struct PairPlayStudioView: View {
         }
     }
 
-    // MARK: - 2. Per-App Audio Routing & Spatial Ear Isolation
+    // MARK: - 2. Virtual Mic Mixer (Multiple Mics + Apps -> Virtual Mic for Calls/Meetings)
+
+    private var virtualMicMixSection: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 12) {
+                virtualMicBusHeaderCard
+
+                Text("1. Microphones to Include in Virtual Mic")
+                    .font(.system(size: 11.5, weight: .bold))
+                    .foregroundColor(Color.white.opacity(0.8))
+
+                ForEach(virtualMic.physicalMics) { mic in
+                    studioVirtualMicSourceCard(mic)
+                }
+
+                Text("2. Application Audio to Mix into Call (Music, Browser, Telegram, Soundboard)")
+                    .font(.system(size: 11.5, weight: .bold))
+                    .foregroundColor(Color.white.opacity(0.8))
+                    .padding(.top, 4)
+
+                if !perAppMixer.supportsPerAppMixing {
+                    Text("Mixing application audio requires macOS 14.2 or newer.")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.white.opacity(0.5))
+                } else if perAppMixer.apps.isEmpty {
+                    Text("No active audio apps running right now. Play sound in Chrome, Spotify, or VLC to mix it into your call.")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.white.opacity(0.5))
+                } else {
+                    ForEach(perAppMixer.apps) { app in
+                        studioVirtualAppSourceCard(app)
+                    }
+                }
+            }
+            .padding(.horizontal, 18)
+        }
+    }
+
+    private var virtualMicBusHeaderCard: some View {
+        let coughBg: Color = virtualMic.isMasterMuted ? Color.red.opacity(0.28) : Color.white.opacity(0.09)
+        let coughFg: Color = virtualMic.isMasterMuted ? .red : .white
+        let duckBg: Color = virtualMic.autoDuckApps ? Color.cyan.opacity(0.22) : Color.white.opacity(0.08)
+        let duckFg: Color = virtualMic.autoDuckApps ? .cyan : Color.white.opacity(0.6)
+        let monBg: Color = virtualMic.monitorInHeadphones ? Color.purple.opacity(0.26) : Color.white.opacity(0.08)
+        let monFg: Color = virtualMic.monitorInHeadphones ? Color(red: 0.85, green: 0.65, blue: 1.0) : Color.white.opacity(0.6)
+        let defBg: Color = virtualMic.setAsSystemDefaultMic ? Color.green.opacity(0.22) : Color.white.opacity(0.08)
+        let defFg: Color = virtualMic.setAsSystemDefaultMic ? .green : Color.white.opacity(0.6)
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Virtual Mic Output Bus")
+                        .font(.system(size: 12.5, weight: .bold))
+                        .foregroundColor(.white)
+                    Text("In Zoom / Google Meet / Telegram / Discord, select \"\(virtualMic.activeVirtualCableName)\" as your Microphone.")
+                        .font(.system(size: 10.5))
+                        .foregroundColor(Color.mint.opacity(0.9))
+                }
+
+                Spacer()
+
+                virtualMicTargetMenu
+            }
+
+            // Master Output Gain + Live Broadcast VU + Cough Mute
+            HStack(spacing: 8) {
+                Button {
+                    virtualMic.isMasterMuted.toggle()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: virtualMic.isMasterMuted ? "mic.slash.fill" : "mic.fill")
+                            .font(.system(size: 10.5, weight: .bold))
+                        Text(virtualMic.isMasterMuted ? "Call Muted" : "Mute Call")
+                            .font(.system(size: 10, weight: .bold))
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4.5)
+                    .background(Capsule().fill(coughBg))
+                    .foregroundColor(coughFg)
+                }
+                .buttonStyle(.plain)
+
+                Slider(
+                    value: Binding(
+                        get: { Double(virtualMic.masterVolume) },
+                        set: { virtualMic.masterVolume = Float($0) }
+                    ),
+                    in: 0...1.5
+                )
+                .tint(.mint)
+
+                Text("\(Int(round(virtualMic.masterVolume * 100)))%")
+                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                    .monospacedDigit()
+                    .foregroundColor(Color.white.opacity(0.8))
+                    .frame(width: 40, alignment: .trailing)
+
+                studioMiniVUBar(level: virtualMic.isMasterMuted ? 0 : virtualMic.masterLevel, color: .mint)
+                    .frame(width: 70, height: 8)
+            }
+
+            // Broadcast Feature Toggles
+            HStack(spacing: 8) {
+                Button {
+                    virtualMic.autoDuckApps.toggle()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "waveform.path.ecg")
+                            .font(.system(size: 9.5))
+                        Text("Auto-Duck Music on Voice")
+                            .font(.system(size: 10, weight: .bold))
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4.5)
+                    .background(Capsule().fill(duckBg))
+                    .foregroundColor(duckFg)
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    virtualMic.toggleMonitorInHeadphones()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "headphones")
+                            .font(.system(size: 9.5))
+                        Text("Hear Mix Locally")
+                            .font(.system(size: 10, weight: .bold))
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4.5)
+                    .background(Capsule().fill(monBg))
+                    .foregroundColor(monFg)
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    virtualMic.toggleSystemDefaultMic(!virtualMic.setAsSystemDefaultMic)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.circle")
+                            .font(.system(size: 9.5))
+                        Text("Set macOS Default Mic")
+                            .font(.system(size: 10, weight: .bold))
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4.5)
+                    .background(Capsule().fill(defBg))
+                    .foregroundColor(defFg)
+                }
+                .buttonStyle(.plain)
+
+                Spacer()
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.mint.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.mint.opacity(0.28), lineWidth: 1))
+    }
+
+    @ViewBuilder
+    private var virtualMicTargetMenu: some View {
+        if virtualMic.virtualCables.isEmpty {
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString("brew install blackhole-2ch", forType: .string)
+                virtualMic.statusMessage = "Copied 'brew install blackhole-2ch' — run in Terminal to add Virtual Mic cable."
+            } label: {
+                Text("Install BlackHole 2ch")
+                    .font(.system(size: 10.5, weight: .bold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Capsule().fill(Color.orange))
+                    .foregroundColor(.black)
+            }
+            .buttonStyle(.plain)
+        } else {
+            Menu {
+                ForEach(virtualMic.virtualCables) { cable in
+                    Button {
+                        virtualMic.selectVirtualCable(uid: cable.uid)
+                    } label: {
+                        HStack {
+                            Text(cable.name)
+                            if cable.uid == virtualMic.selectedVirtualCableUID {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "cable.connector")
+                        .font(.system(size: 10))
+                    Text(virtualMic.activeVirtualCableName)
+                        .font(.system(size: 11, weight: .bold))
+                        .lineLimit(1)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8.5, weight: .bold))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(Color.mint.opacity(0.22)))
+                .foregroundColor(.mint)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+        }
+    }
+
+    private func studioVirtualMicSourceCard(_ mic: AudioInputDevice) -> some View {
+        let selected = virtualMic.selectedMicUIDs.contains(mic.uid)
+        let vol = virtualMic.micVolumes[mic.uid] ?? 1.0
+        let muted = virtualMic.micMuted[mic.uid] ?? false
+        let noiseCut = virtualMic.micNoiseCut[mic.uid] ?? true
+        let level = virtualMic.micLevels[mic.uid] ?? 0
+        let checkFg: Color = (virtualMic.isActive && selected) ? .green : (selected ? .mint : Color.white.opacity(0.35))
+        let cardBg: Color = selected ? Color.mint.opacity(0.08) : Color.white.opacity(0.04)
+        let ncBg: Color = noiseCut ? Color.cyan.opacity(0.22) : Color.white.opacity(0.08)
+        let ncFg: Color = noiseCut ? .cyan : Color.white.opacity(0.55)
+
+        return VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                Button {
+                    virtualMic.toggleMic(mic)
+                } label: {
+                    HStack(spacing: 9) {
+                        Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundColor(checkFg)
+                        Image(systemName: mic.sfSymbol)
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundColor(.mint)
+                        Text(mic.name)
+                            .font(.system(size: 12.5, weight: .bold))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                }
+                .buttonStyle(.plain)
+
+                if selected {
+                    studioMiniVUBar(level: muted ? 0 : level, color: .green)
+                        .frame(width: 56, height: 6)
+
+                    Button {
+                        virtualMic.toggleMicNoiseCut(uid: mic.uid)
+                    } label: {
+                        Text("Noise Cut")
+                            .font(.system(size: 9.5, weight: .bold))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Capsule().fill(ncBg))
+                            .foregroundColor(ncFg)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            if selected {
+                HStack(spacing: 8) {
+                    Button {
+                        virtualMic.toggleMicMute(uid: mic.uid)
+                    } label: {
+                        Image(systemName: muted ? "mic.slash.fill" : "mic.fill")
+                            .font(.system(size: 11.5))
+                            .foregroundColor(muted ? .red : Color.white.opacity(0.8))
+                            .frame(width: 20)
+                    }
+                    .buttonStyle(.plain)
+
+                    Slider(
+                        value: Binding(
+                            get: { Double(virtualMic.micVolumes[mic.uid] ?? 1.0) },
+                            set: { v in virtualMic.setMicVolume(uid: mic.uid, volume: Float(v)) }
+                        ),
+                        in: 0...2.0
+                    )
+                    .tint(.mint)
+
+                    Text(muted ? "Muted" : "\(Int(round(vol * 100)))%")
+                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                        .monospacedDigit()
+                        .foregroundColor(muted ? .red : Color.white.opacity(0.8))
+                        .frame(width: 44, alignment: .trailing)
+                }
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 11).fill(cardBg))
+    }
+
+    private func studioVirtualAppSourceCard(_ app: AudioAppSource) -> some View {
+        let key = app.bundleID
+        let selected = virtualMic.selectedAppKeys.contains(key)
+        let vol = virtualMic.appVolumes[key] ?? 0.45
+        let muted = virtualMic.appMuted[key] ?? false
+        let callOnly = virtualMic.appMuteLocal[key] ?? false
+        let level = virtualMic.appLevels[key] ?? 0
+        let checkFg: Color = (virtualMic.isActive && selected) ? .green : (selected ? .cyan : Color.white.opacity(0.35))
+        let cardBg: Color = selected ? Color.cyan.opacity(0.08) : Color.white.opacity(0.04)
+        let modeColor: Color = callOnly ? .orange : .cyan
+
+        return VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                Button {
+                    virtualMic.toggleApp(app)
+                } label: {
+                    HStack(spacing: 9) {
+                        Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundColor(checkFg)
+                        Image(nsImage: app.icon)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 22, height: 22)
+                            .clipShape(RoundedRectangle(cornerRadius: 5))
+                        Text(app.name)
+                            .font(.system(size: 12.5, weight: .bold))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                        if app.isRunningOutput {
+                            Circle().fill(Color.green).frame(width: 5.5, height: 5.5)
+                        }
+                        Spacer()
+                    }
+                }
+                .buttonStyle(.plain)
+
+                if selected {
+                    studioMiniVUBar(level: muted ? 0 : level, color: .cyan)
+                        .frame(width: 56, height: 6)
+
+                    Button {
+                        virtualMic.toggleAppMuteLocal(key: key)
+                    } label: {
+                        Text(callOnly ? "Send to Call Only" : "Hear + Send to Call")
+                            .font(.system(size: 9.5, weight: .bold))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Capsule().fill(modeColor.opacity(0.20)))
+                            .foregroundColor(modeColor)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            if selected {
+                HStack(spacing: 8) {
+                    Button {
+                        virtualMic.toggleAppMute(key: key)
+                    } label: {
+                        Image(systemName: muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                            .font(.system(size: 11.5))
+                            .foregroundColor(muted ? .red : Color.white.opacity(0.8))
+                            .frame(width: 20)
+                    }
+                    .buttonStyle(.plain)
+
+                    Slider(
+                        value: Binding(
+                            get: { Double(virtualMic.appVolumes[key] ?? 0.45) },
+                            set: { v in virtualMic.setAppVolume(key: key, volume: Float(v)) }
+                        ),
+                        in: 0...1.5
+                    )
+                    .tint(.cyan)
+
+                    Text(muted ? "Muted" : "\(Int(round(vol * 100)))%")
+                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                        .monospacedDigit()
+                        .foregroundColor(muted ? .red : Color.white.opacity(0.8))
+                        .frame(width: 44, alignment: .trailing)
+                }
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 11).fill(cardBg))
+    }
+
+    private func studioMiniVUBar(level: Float, color: Color) -> some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.white.opacity(0.12))
+                Capsule()
+                    .fill(color)
+                    .frame(width: max(0, geo.size.width * CGFloat(min(1.0, max(0.0, level)))))
+                    .animation(.linear(duration: 0.06), value: level)
+            }
+        }
+    }
+
+    // MARK: - 3. Per-App Audio Routing & Spatial Ear Isolation
 
     private var appRouterSection: some View {
         ScrollView(.vertical, showsIndicators: false) {
@@ -648,7 +1101,7 @@ struct PairPlayStudioView: View {
         }
     }
 
-    // MARK: - 3. Millisecond Latency Calibration + Rhythmic Sync Test
+    // MARK: - 4. Millisecond Latency Calibration + Rhythmic Sync Test
 
     private var latencySyncSection: some View {
         let activeDevices = pairableDevices.filter { pairPlay.selectedUIDs.contains($0.uid) }
@@ -783,16 +1236,16 @@ struct PairPlayStudioView: View {
         .background(RoundedRectangle(cornerRadius: 11).fill(Color.white.opacity(0.05)))
     }
 
-    // MARK: - 4. Real-Time Mic Voice FX & Noise Cut
+    // MARK: - 5. Single-Mic Real-Time Voice FX
 
     private var voiceFXSection: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Real-time hardware microphone voice effects & noise suppression across Discord, Zoom, Telegram, and games.")
+                Text("Real-time single microphone voice effects (Pitch, Reverb, Echo, Radio, Robot) & noise cut.")
                     .font(.system(size: 11))
                     .foregroundColor(Color.white.opacity(0.55))
 
-                MicTabView()
+                MicTabView(showModeBar: false)
                     .padding(12)
                     .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.05)))
             }

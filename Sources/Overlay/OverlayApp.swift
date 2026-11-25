@@ -32,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         appState.perAppMixer.teardownAllTaps()
+        appState.virtualMicService.stopMix()
         appState.inputAudio.stopFXEngine()
         if let ref = hotKeyRef {
             UnregisterEventHotKey(ref)
@@ -49,6 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Pin / Unpin Notch", action: #selector(togglePin), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "PairPlay Audio Studio…", action: #selector(openPairPlayStudio), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Virtual Mic Mixer…", action: #selector(openVirtualMicStudio), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "VPN Configurations…", action: #selector(openVPNConfigs), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem.separator())
@@ -65,7 +67,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openPairPlayStudio() {
-        PairPlayWindowController.show(appState: appState)
+        PairPlayWindowController.show(appState: appState, initialSection: .multiOutput)
+    }
+
+    @objc private func openVirtualMicStudio() {
+        PairPlayWindowController.show(appState: appState, initialSection: .virtualMicMix)
     }
 
     @objc private func openVPNConfigs() {

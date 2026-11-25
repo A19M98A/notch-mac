@@ -90,6 +90,7 @@ final class AppState: ObservableObject {
     let systemAudio = SystemAudioManager()
     let pairPlayService = PairPlayService()
     let inputAudio = InputAudioManager()
+    let virtualMicService = VirtualMicService()
     let perAppMixer = PerAppAudioMixer()
     let mediaService = MediaRemoteService()
     let notificationService = NotificationService()
@@ -105,7 +106,11 @@ final class AppState: ObservableObject {
     init() {
         pairPlayService.systemAudio = systemAudio
         systemAudio.pairPlay = pairPlayService
+        virtualMicService.inputAudio = inputAudio
+        virtualMicService.systemAudio = systemAudio
+        virtualMicService.perAppMixer = perAppMixer
         systemAudio.refreshAll()
+        virtualMicService.syncDevices()
         loadSettings()
         applyPreferencesToServices()
 

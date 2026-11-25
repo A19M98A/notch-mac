@@ -59,6 +59,7 @@ final class NotchWindowController: NSWindowController {
             .environmentObject(appState.systemAudio)
             .environmentObject(appState.pairPlayService)
             .environmentObject(appState.inputAudio)
+            .environmentObject(appState.virtualMicService)
             .environmentObject(appState.perAppMixer)
             .environmentObject(appState.mediaService)
             .environmentObject(appState.notificationService)

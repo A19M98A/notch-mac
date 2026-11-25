@@ -834,7 +834,7 @@ final class InputAudioManager: ObservableObject {
 
     // MARK: - CoreAudio Input Queries
 
-    private func fetchDefaultInputDeviceID() -> AudioDeviceID {
+    func fetchDefaultInputDeviceID() -> AudioDeviceID {
         var devID: AudioDeviceID = kAudioObjectUnknown
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
         var address = AudioObjectPropertyAddress(
@@ -866,12 +866,17 @@ final class InputAudioManager: ObservableObject {
         for id in deviceIDs {
             let name = getDeviceStringProperty(id, selector: kAudioObjectPropertyName) ?? ""
             let uid = getDeviceStringProperty(id, selector: kAudioDevicePropertyDeviceUID) ?? "\(id)"
-            if uid.hasPrefix("com.overlay.tap.") || name.hasPrefix("OverlayTap-") { continue }
+            if uid.hasPrefix("com.overlay.tap.") || name.hasPrefix("OverlayTap-") ||
+               uid.hasPrefix(PairPlayService.aggregateUIDPrefix) || name.hasPrefix(PairPlayService.aggregateNamePrefix) {
+                continue
+            }
+            let transport = getDeviceUInt32Property(id, selector: kAudioDevicePropertyTransportType) ?? 0
             let lower = name.lowercased()
-            let isVirtual = lower.contains("blackhole") || lower.contains("vb-cable") ||
+            let isVirtual = transport == kAudioDeviceTransportTypeVirtual ||
+                            lower.contains("blackhole") || lower.contains("vb-cable") ||
                             lower.contains("loopback") || lower.contains("soundflower")
-            guard isVirtual else { continue }
-            // Verify it has output channels
+            guard isVirtual, hasInputStreams(deviceID: id) else { continue }
+            // Verify it also has output channels so we can write mixed audio into it
             var outAddr = AudioObjectPropertyAddress(
                 mSelector: kAudioDevicePropertyStreamConfiguration,
                 mScope: kAudioDevicePropertyScopeOutput,
@@ -879,9 +884,19 @@ final class InputAudioManager: ObservableObject {
             )
             var outSize: UInt32 = 0
             guard AudioObjectGetPropertyDataSize(id, &outAddr, 0, nil, &outSize) == noErr, outSize > 0 else { continue }
+            let rawPtr = UnsafeMutableRawPointer.allocate(byteCount: Int(outSize), alignment: MemoryLayout<AudioBufferList>.alignment)
+            defer { rawPtr.deallocate() }
+            guard AudioObjectGetPropertyData(id, &outAddr, 0, nil, &outSize, rawPtr) == noErr else { continue }
+            let outBufs = UnsafeMutableAudioBufferListPointer(rawPtr.assumingMemoryBound(to: AudioBufferList.self))
+            guard outBufs.reduce(0, { $0 + Int($1.mNumberChannels) }) > 0 else { continue }
             result.append(AudioInputDevice(id: id, name: name, uid: uid, transportType: kAudioDeviceTransportTypeVirtual, isDefault: false))
         }
-        return result
+        return result.sorted { a, b in
+            let aBH = a.name.lowercased().contains("blackhole")
+            let bBH = b.name.lowercased().contains("blackhole")
+            if aBH != bBH { return aBH }
+            return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+        }
     }
 
     private func fetchInputDevices(defaultID: AudioDeviceID) -> [AudioInputDevice] {
