@@ -48,6 +48,8 @@ final class SystemAudioManager: ObservableObject {
     @Published var defaultOutputDeviceID: AudioDeviceID = kAudioObjectUnknown
     @Published var lastVolumeChangeDate: Date = .distantPast
 
+    weak var pairPlay: PairPlayService?
+
     private var monitoredDeviceID: AudioDeviceID = kAudioObjectUnknown
     private var defaultDeviceListenerBlock: AudioObjectPropertyListenerBlock?
     private var devicesListListenerBlock: AudioObjectPropertyListenerBlock?
@@ -72,8 +74,11 @@ final class SystemAudioManager: ObservableObject {
         DispatchQueue.main.async {
             self.defaultOutputDeviceID = defID
             self.outputDevices = devices
-            self.volume = vol
-            self.isMuted = muted
+            if self.pairPlay?.isActive != true {
+                self.volume = vol
+                self.isMuted = muted
+            }
+            self.pairPlay?.syncAvailableDevices(devices)
         }
 
         if defID != monitoredDeviceID {
@@ -89,6 +94,19 @@ final class SystemAudioManager: ObservableObject {
 
     func setVolume(_ newVolume: Float) {
         let clamped = max(0, min(1, newVolume))
+        if let pp = pairPlay, pp.isActive {
+            pp.applyMasterVolume(clamped)
+            if clamped > 0.001 && isMuted {
+                pp.applyMasterMute(false)
+                DispatchQueue.main.async { self.isMuted = false }
+            }
+            DispatchQueue.main.async {
+                self.volume = clamped
+                self.lastVolumeChangeDate = Date()
+            }
+            return
+        }
+
         let devID = defaultOutputDeviceID != kAudioObjectUnknown ? defaultOutputDeviceID : fetchDefaultOutputDeviceID()
         guard devID != kAudioObjectUnknown else { return }
 
@@ -126,6 +144,15 @@ final class SystemAudioManager: ObservableObject {
     }
 
     func setMuted(_ muted: Bool) {
+        if let pp = pairPlay, pp.isActive {
+            pp.applyMasterMute(muted)
+            DispatchQueue.main.async {
+                self.isMuted = muted
+                self.lastVolumeChangeDate = Date()
+            }
+            return
+        }
+
         let devID = defaultOutputDeviceID != kAudioObjectUnknown ? defaultOutputDeviceID : fetchDefaultOutputDeviceID()
         guard devID != kAudioObjectUnknown else { return }
 
@@ -150,6 +177,9 @@ final class SystemAudioManager: ObservableObject {
     }
 
     func setDefaultOutputDevice(_ deviceID: AudioDeviceID) {
+        if let pp = pairPlay, pp.isActive {
+            pp.stopPairPlay()
+        }
         var devID = deviceID
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultOutputDevice,
@@ -205,7 +235,8 @@ final class SystemAudioManager: ObservableObject {
             // Skip our own internal aggregate devices created for per-app taps
             let name = getDeviceStringProperty(id, selector: kAudioObjectPropertyName) ?? "Unknown Device"
             let uid = getDeviceStringProperty(id, selector: kAudioDevicePropertyDeviceUID) ?? "\(id)"
-            if uid.hasPrefix("com.overlay.tap.") || name.hasPrefix("OverlayTap-") {
+            if uid.hasPrefix("com.overlay.tap.") || name.hasPrefix("OverlayTap-") ||
+               uid.hasPrefix(PairPlayService.aggregateUIDPrefix) || name.hasPrefix(PairPlayService.aggregateNamePrefix) {
                 continue
             }
 

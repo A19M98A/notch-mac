@@ -296,7 +296,7 @@ enum VPNURIParser {
             "log": ["level": "warn"],
             "dns": [
                 "servers": [
-                    ["tag": "remote", "type": "udp", "server": "1.1.1.1", "detour": "proxy"],
+                    ["tag": "remote", "type": "tcp", "server": "1.1.1.1", "detour": "proxy"],
                     ["tag": "local", "type": "udp", "server": "8.8.8.8"]
                 ],
                 "final": mode == .vpnDefault ? "remote" : "local"

@@ -48,6 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Toggle NotchPulse (⌥Space)", action: #selector(toggleNotch), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Pin / Unpin Notch", action: #selector(togglePin), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "PairPlay Audio Studio…", action: #selector(openPairPlayStudio), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "VPN Configurations…", action: #selector(openVPNConfigs), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem.separator())
@@ -61,6 +62,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func togglePin() {
         appState.togglePin()
+    }
+
+    @objc private func openPairPlayStudio() {
+        PairPlayWindowController.show(appState: appState)
     }
 
     @objc private func openVPNConfigs() {

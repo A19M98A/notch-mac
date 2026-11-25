@@ -3,6 +3,7 @@ import SwiftUI
 struct NotchRootView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var systemAudio: SystemAudioManager
+    @EnvironmentObject var pairPlay: PairPlayService
     @EnvironmentObject var mediaService: MediaRemoteService
     @EnvironmentObject var notificationService: NotificationService
     @EnvironmentObject var vpnService: VPNService
@@ -385,13 +386,19 @@ struct NotchRootView: View {
                     .frame(width: 5, height: 5)
             }
 
+            if pairPlay.isActive {
+                Circle()
+                    .fill(Color.cyan)
+                    .frame(width: 5, height: 5)
+            }
+
             if timerService.isActiveInNotch {
                 Circle()
                     .fill(Color.orange)
                     .frame(width: 5, height: 5)
             }
 
-            if !(appState.prefs.showVPNDotInIdle && vpnService.liveStatus.connected) && !mediaService.track.isPlaying && !timerService.isActiveInNotch {
+            if !(appState.prefs.showVPNDotInIdle && vpnService.liveStatus.connected) && !mediaService.track.isPlaying && !timerService.isActiveInNotch && !pairPlay.isActive {
                 Capsule()
                     .fill(Color.white.opacity(0.28))
                     .frame(width: 24, height: 3)
@@ -521,12 +528,18 @@ struct NotchRootView: View {
 
                 Spacer(minLength: 6)
 
-                // Right ear: VPN shield + Timer badge + Media artwork/equalizer
+                // Right ear: VPN shield + PairPlay + Timer badge + Media artwork/equalizer
                 HStack(spacing: 6) {
                     if vpnService.liveStatus.connected {
                         Image(systemName: "lock.shield.fill")
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(.green)
+                    }
+
+                    if pairPlay.isActive {
+                        Image(systemName: "person.2.wave.2.fill")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(.cyan)
                     }
 
                     if timerService.isActiveInNotch {

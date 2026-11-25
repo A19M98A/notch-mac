@@ -58,11 +58,12 @@ struct NotchPreferences: Codable, Equatable {
     var showVPNDotInIdle: Bool = true
     var showNotificationPopups: Bool = true
     var notificationDuration: Double = 3.0
-    var autoDismissMacBanner: Bool = false
+    var autoDismissMacBanner: Bool = true
     var readNotificationDatabase: Bool = true
     var clipboardLimit: Int = 100
     var autoSwitchSystemMic: Bool = true
     var launchAtLogin: Bool = false
+    var updateChannel: String = "stable"
 }
 
 final class AppState: ObservableObject {
@@ -87,6 +88,7 @@ final class AppState: ObservableObject {
     }()
 
     let systemAudio = SystemAudioManager()
+    let pairPlayService = PairPlayService()
     let inputAudio = InputAudioManager()
     let perAppMixer = PerAppAudioMixer()
     let mediaService = MediaRemoteService()
@@ -95,11 +97,15 @@ final class AppState: ObservableObject {
     let networkMonitor = NetworkMonitorService()
     let timerService = TimerService()
     let clipboardService = ClipboardService()
+    let updateService = UpdateService()
 
     private var cancellables = Set<AnyCancellable>()
     private var hudDismissWorkItem: DispatchWorkItem?
 
     init() {
+        pairPlayService.systemAudio = systemAudio
+        systemAudio.pairPlay = pairPlayService
+        systemAudio.refreshAll()
         loadSettings()
         applyPreferencesToServices()
 
@@ -152,6 +158,7 @@ final class AppState: ObservableObject {
         notificationService.popupDuration = prefs.notificationDuration
         notificationService.autoDismissMacBanner = prefs.autoDismissMacBanner
         notificationService.readNotificationDatabase = prefs.readNotificationDatabase
+        updateService.channel = UpdateChannel(rawValue: prefs.updateChannel) ?? .stable
         updateLaunchAgent(enabled: prefs.launchAtLogin)
     }
 

@@ -21,56 +21,252 @@ struct CapturedNotification: Identifiable, Equatable {
     }
 }
 
-/// Captures incoming macOS notification banners via NotificationCenter's Accessibility tree
-/// and supports inline Quick Reply, Mark as Read, Open App, and Dismiss actions.
+/// Instant macOS notification capture & Notch-Only banner suppressor:
+/// 1. Real-time `AXObserver` attached to `com.apple.notificationcenterui` (< 2 ms reaction when a banner spawns)
+/// 2. Instant off-screen window teleport + deep SwiftUI custom-action `Close` dismissal when `autoDismissMacBanner` (Notch-Only Mode) is ON
+/// 3. Event-driven `kqueue` file watcher (`db-wal` + `db`) + `PRAGMA read_uncommitted = 1` SQLite reader for zero-delay DND capture
 final class NotificationService: ObservableObject {
     @Published var activePopup: CapturedNotification? = nil
     @Published var recentNotifications: [CapturedNotification] = []
     @Published var isReplying: Bool = false
     @Published var replyText: String = ""
     @Published var isHoveringPopup: Bool = false
+    @Published var canReadNotificationDB: Bool = false
+    @Published var isAccessibilityTrusted: Bool = AXIsProcessTrusted()
 
     var enabled: Bool = true
     var popupDuration: TimeInterval = 3.0
-    var autoDismissMacBanner: Bool = false
+    /// "Notch-Only Mode": when true, completely suppresses macOS's top-right system notification popup
+    /// and displays notifications exclusively under the Notch.
+    var autoDismissMacBanner: Bool = true {
+        didSet {
+            if autoDismissMacBanner {
+                handleImmediateAXEvent()
+            }
+        }
+    }
     var readNotificationDatabase: Bool = true
 
-    @Published var canReadNotificationDB: Bool = false
-
-    private var pollTimer: Timer?
+    private var fastPollTimer: Timer?
     private var dismissWorkItem: DispatchWorkItem?
+    private let scanQueue = DispatchQueue(label: "com.amin.notchpulse.notifscan", qos: .userInteractive)
     private var seenTimestamps: [String: Date] = [:]
     private var liveBannerElements: [UUID: AXUIElement] = [:]
     private var lastDBRecID: Int64 = -1
+    private var lastWALMtime: timespec = timespec(tv_sec: 0, tv_nsec: 0)
     private let maxHistory = 30
+
+    // Real-time AXObserver for com.apple.notificationcenterui
+    private var axObserver: AXObserver?
+    private var observedNCPID: pid_t = 0
+
+    // Real-time kqueue file watchers for SQLite WAL & DB
+    private var walWatcher: DispatchSourceFileSystemObject?
+    private var dbWatcher: DispatchSourceFileSystemObject?
+    private var watchedDBPath: String?
 
     init() {
         checkDatabaseAccess()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.45, repeats: true) { [weak self] _ in
-            self?.scanAllSources()
-        }
-    }
+        setupRealtimeWatchers()
 
-    private func scanAllSources() {
-        if readNotificationDatabase {
-            scanNotificationDatabase()
+        // Fast lightweight heartbeat (100ms): checks WAL mtime (~2µs stat) & keeps AXObserver attached
+        fastPollTimer = Timer.scheduledTimer(withTimeInterval: 0.10, repeats: true) { [weak self] _ in
+            self?.heartbeatTick()
         }
-        scanNotificationCenter()
     }
 
     deinit {
-        pollTimer?.invalidate()
+        fastPollTimer?.invalidate()
         dismissWorkItem?.cancel()
+        teardownAXObserver()
+        teardownDBWatchers()
     }
 
-    // MARK: - Popup Lifecycle (3-second auto-dismiss, paused on hover or while typing reply)
+    // MARK: - Real-Time Watchers (0 ms AXObserver + 0 ms kqueue WAL Watcher)
 
-    func showPopup(_ notif: CapturedNotification, axBanner: AXUIElement? = nil) {
+    private func setupRealtimeWatchers() {
+        ensureAXObserverAttached()
+        scanQueue.async { [weak self] in
+            guard let self else { return }
+            if let path = self.resolveNotificationDBPath() {
+                self.installDBFileWatchersIfNeeded(dbPath: path)
+                self.scanNotificationDatabaseSync(force: true)
+            }
+        }
+    }
+
+    private func heartbeatTick() {
+        let trusted = AXIsProcessTrusted()
+        if trusted != isAccessibilityTrusted {
+            isAccessibilityTrusted = trusted
+        }
+
+        guard enabled else { return }
+
+        if trusted {
+            ensureAXObserverAttached()
+        } else if observedNCPID != 0 {
+            teardownAXObserver()
+        }
+
+        let shouldReadDB = readNotificationDatabase
+        let shouldAutoDismiss = autoDismissMacBanner
+        let ncPID = trusted ? observedNCPID : 0
+
+        scanQueue.async { [weak self] in
+            guard let self else { return }
+            if shouldReadDB {
+                if let path = self.watchedDBPath ?? self.resolveNotificationDBPath() {
+                    self.installDBFileWatchersIfNeeded(dbPath: path)
+                    if self.hasDBChangedOnDisk(dbPath: path) {
+                        self.scanNotificationDatabaseSync(force: false)
+                    }
+                }
+            }
+            if ncPID > 0 {
+                self.scanNotificationCenterSync(ncPID: ncPID, autoDismiss: shouldAutoDismiss)
+            }
+        }
+    }
+
+    fileprivate func handleImmediateAXEvent() {
+        guard enabled, AXIsProcessTrusted() else { return }
+        let pid = observedNCPID
+        guard pid > 0 else { return }
+        let autoDismiss = autoDismissMacBanner
+
+        scanQueue.async { [weak self] in
+            guard let self else { return }
+            self.scanNotificationCenterSync(ncPID: pid, autoDismiss: autoDismiss)
+        }
+        // Second micro-pass 22ms later in case SwiftUI populated AXStaticText nodes 1 frame after window creation
+        scanQueue.asyncAfter(deadline: .now() + 0.022) { [weak self] in
+            guard let self else { return }
+            self.scanNotificationCenterSync(ncPID: pid, autoDismiss: autoDismiss)
+        }
+    }
+
+    private func ensureAXObserverAttached() {
+        guard AXIsProcessTrusted(),
+              let ncApp = NSWorkspace.shared.runningApplications.first(where: {
+                  $0.bundleIdentifier == "com.apple.notificationcenterui"
+              }) else {
+            return
+        }
+
+        let pid = ncApp.processIdentifier
+        guard pid > 0, pid != observedNCPID else { return }
+
+        teardownAXObserver()
+
+        let callback: AXObserverCallback = { _, _, _, refcon in
+            guard let refcon else { return }
+            let service = Unmanaged<NotificationService>.fromOpaque(refcon).takeUnretainedValue()
+            service.handleImmediateAXEvent()
+        }
+
+        var obs: AXObserver?
+        guard AXObserverCreate(pid, callback, &obs) == .success, let observer = obs else {
+            return
+        }
+
+        let appElem = AXUIElementCreateApplication(pid)
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+
+        let notifications: [String] = [
+            kAXWindowCreatedNotification as String,
+            kAXCreatedNotification as String,
+            kAXLayoutChangedNotification as String,
+            kAXMovedNotification as String,
+            kAXUIElementDestroyedNotification as String
+        ]
+        for notif in notifications {
+            AXObserverAddNotification(observer, appElem, notif as CFString, selfPtr)
+        }
+
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        axObserver = observer
+        observedNCPID = pid
+    }
+
+    private func teardownAXObserver() {
+        if let obs = axObserver {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .commonModes)
+            axObserver = nil
+        }
+        observedNCPID = 0
+    }
+
+    private func installDBFileWatchersIfNeeded(dbPath: String) {
+        guard watchedDBPath != dbPath else { return }
+        teardownDBWatchers()
+        watchedDBPath = dbPath
+
+        let walPath = dbPath + "-wal"
+        walWatcher = makeFileWatcher(path: walPath)
+        dbWatcher = makeFileWatcher(path: dbPath)
+    }
+
+    private func makeFileWatcher(path: String) -> DispatchSourceFileSystemObject? {
+        let fd = open(path, O_EVTONLY)
+        guard fd >= 0 else { return nil }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .extend, .attrib, .rename, .delete],
+            queue: scanQueue
+        )
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            let flags = source.data
+            if flags.contains(.delete) || flags.contains(.rename) {
+                self.watchedDBPath = nil
+            }
+            if self.enabled && self.readNotificationDatabase {
+                self.scanNotificationDatabaseSync(force: true)
+            }
+        }
+        source.setCancelHandler {
+            close(fd)
+        }
+        source.resume()
+        return source
+    }
+
+    private func teardownDBWatchers() {
+        walWatcher?.cancel()
+        walWatcher = nil
+        dbWatcher?.cancel()
+        dbWatcher = nil
+        watchedDBPath = nil
+    }
+
+    private func hasDBChangedOnDisk(dbPath: String) -> Bool {
+        var st = stat()
+        let walPath = dbPath + "-wal"
+        if stat(walPath, &st) == 0 {
+            if st.st_mtimespec.tv_sec != lastWALMtime.tv_sec || st.st_mtimespec.tv_nsec != lastWALMtime.tv_nsec {
+                lastWALMtime = st.st_mtimespec
+                return true
+            }
+            return false
+        }
+        if stat(dbPath, &st) == 0 {
+            if st.st_mtimespec.tv_sec != lastWALMtime.tv_sec || st.st_mtimespec.tv_nsec != lastWALMtime.tv_nsec {
+                lastWALMtime = st.st_mtimespec
+                return true
+            }
+        }
+        return false
+    }
+
+    // MARK: - Popup Lifecycle (Paused on hover or while typing reply)
+
+    func showPopup(_ notif: CapturedNotification, axBanner: AXUIElement? = nil, playSubtleSound: Bool = false) {
         if let axBanner {
             liveBannerElements[notif.id] = axBanner
         }
         DispatchQueue.main.async {
-            if !self.recentNotifications.contains(where: { $0.dedupeKey == notif.dedupeKey && Date().timeIntervalSince($0.date) < 5 }) {
+            if !self.recentNotifications.contains(where: { $0.dedupeKey == notif.dedupeKey && Date().timeIntervalSince($0.date) < 8 }) {
                 self.recentNotifications.insert(notif, at: 0)
                 if self.recentNotifications.count > self.maxHistory {
                     self.recentNotifications = Array(self.recentNotifications.prefix(self.maxHistory))
@@ -78,6 +274,10 @@ final class NotificationService: ObservableObject {
             }
 
             guard self.enabled else { return }
+            if playSubtleSound, let sound = NSSound(named: NSSound.Name("Glass")) ?? NSSound(named: NSSound.Name("Tink")) {
+                sound.volume = 0.45
+                sound.play()
+            }
             self.isReplying = false
             self.replyText = ""
             self.activePopup = notif
@@ -117,8 +317,8 @@ final class NotificationService: ObservableObject {
     func dismissPopup(alsoDismissSystemBanner: Bool = false) {
         dismissWorkItem?.cancel()
         if alsoDismissSystemBanner, let current = activePopup, let banner = liveBannerElements[current.id] {
-            DispatchQueue.global(qos: .userInitiated).async {
-                _ = self.pressAXAction(on: banner, matching: ["close", "dismiss", "clear"])
+            scanQueue.async {
+                self.dismissBannerElement(banner, owningWindow: nil)
             }
         }
         activePopup = nil
@@ -136,11 +336,19 @@ final class NotificationService: ObservableObject {
             appIcon: tgIcon,
             title: "Alex",
             subtitle: "",
-            body: "Hey! Testing NotchPulse notification popup & quick reply.",
+            body: "Instant Notch-Only notification test!",
             date: Date(),
             isTest: true
         )
-        showPopup(test)
+        showPopup(test, playSubtleSound: true)
+    }
+
+    func requestAccessibilityPermission() {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     // MARK: - Notification Actions (Reply, Mark as Read, Open App)
@@ -152,11 +360,9 @@ final class NotificationService: ObservableObject {
         }
         if let banner = liveBannerElements[notif.id] {
             DispatchQueue.global(qos: .userInitiated).async {
-                // 1. Try native "Mark as Read" action on the macOS notification banner
-                if self.pressAXAction(on: banner, matching: ["mark as read", "read"]) {
+                if self.pressAXAction(on: banner, matching: ["mark as read", "read"], maxDepth: 10) {
                     return
                 }
-                // 2. Otherwise click the banner itself to open the conversation & mark read
                 _ = AXUIElementPerformAction(banner, kAXPressAction as CFString)
             }
         } else {
@@ -195,12 +401,10 @@ final class NotificationService: ObservableObject {
         dismissPopup()
 
         DispatchQueue.global(qos: .userInitiated).async {
-            // 1. Try native inline AX Reply directly inside macOS NotificationCenter banner (works in background!)
             if let banner, self.tryNativeAXReply(banner: banner, message: trimmed) {
                 return
             }
 
-            // 2. Try clicking the macOS banner to jump directly into the exact chat
             var openedViaBanner = false
             if let banner {
                 openedViaBanner = (AXUIElementPerformAction(banner, kAXPressAction as CFString) == .success)
@@ -212,7 +416,6 @@ final class NotificationService: ObservableObject {
                 return
             }
 
-            // 3. Banner already auto-dismissed: activate the app (e.g. Telegram), jump to sender's chat via Cmd+K, and send!
             DispatchQueue.main.sync {
                 self.activateApp(named: notif.appName, bundleID: notif.bundleID)
             }
@@ -222,12 +425,11 @@ final class NotificationService: ObservableObject {
             if (lowerApp.contains("telegram") || lowerApp.contains("discord") || lowerApp.contains("slack")),
                !notif.title.isEmpty,
                notif.title.lowercased() != notif.appName.lowercased() {
-                // Open Quick Switcher (Cmd+K), search sender name, press Return to open exact chat
                 self.postKeyCombo(keyCode: 40, flags: .maskCommand) // Cmd+K
                 Thread.sleep(forTimeInterval: 0.25)
                 self.pasteTextOnly(notif.title)
                 Thread.sleep(forTimeInterval: 0.35)
-                self.postKeyCombo(keyCode: 36, flags: []) // Return -> opens chat & focuses input box
+                self.postKeyCombo(keyCode: 36, flags: []) // Return
                 Thread.sleep(forTimeInterval: 0.30)
             }
 
@@ -236,22 +438,19 @@ final class NotificationService: ObservableObject {
     }
 
     private func tryNativeAXReply(banner: AXUIElement, message: String) -> Bool {
-        // Click "Reply" button/action on the banner first if present
-        guard pressAXAction(on: banner, matching: ["reply"]) else {
+        guard pressAXAction(on: banner, matching: ["reply"], maxDepth: 10) else {
             return false
         }
-        Thread.sleep(forTimeInterval: 0.28)
+        Thread.sleep(forTimeInterval: 0.25)
 
-        // Find the AXTextField / AXTextArea that opened inside the banner
-        guard let textField = findAXElement(in: banner, roles: [kAXTextFieldRole as String, kAXTextAreaRole as String], depth: 0, maxDepth: 8) else {
+        guard let textField = findAXElement(in: banner, roles: [kAXTextFieldRole as String, kAXTextAreaRole as String], depth: 0, maxDepth: 12) else {
             return false
         }
         let setRes = AXUIElementSetAttributeValue(textField, kAXValueAttribute as CFString, message as CFTypeRef)
         guard setRes == .success else { return false }
-        Thread.sleep(forTimeInterval: 0.12)
+        Thread.sleep(forTimeInterval: 0.10)
 
-        // Click "Send" button if present, or press Return on the text field
-        if pressAXAction(on: banner, matching: ["send"]) {
+        if pressAXAction(on: banner, matching: ["send"], maxDepth: 10) {
             return true
         }
         return AXUIElementPerformAction(textField, kAXConfirmAction as CFString) == .success
@@ -266,7 +465,7 @@ final class NotificationService: ObservableObject {
             return prev
         }
         Thread.sleep(forTimeInterval: 0.06)
-        postKeyCombo(keyCode: 9, flags: .maskCommand) // Cmd+V
+        postKeyCombo(keyCode: 9, flags: .maskCommand)
         Thread.sleep(forTimeInterval: 0.12)
         if let saved {
             DispatchQueue.main.async {
@@ -286,9 +485,9 @@ final class NotificationService: ObservableObject {
             return prev
         }
         Thread.sleep(forTimeInterval: 0.08)
-        postKeyCombo(keyCode: 9, flags: .maskCommand) // Cmd+V
+        postKeyCombo(keyCode: 9, flags: .maskCommand)
         Thread.sleep(forTimeInterval: 0.14)
-        postKeyCombo(keyCode: 36, flags: [])          // Return
+        postKeyCombo(keyCode: 36, flags: [])
         Thread.sleep(forTimeInterval: 0.15)
         if let saved {
             DispatchQueue.main.async {
@@ -324,46 +523,113 @@ final class NotificationService: ObservableObject {
         }
     }
 
-    // MARK: - NotificationCenter AX Scanner
+    // MARK: - Instant NotificationCenter AX Scanner & System Popup Suppressor
 
-    private func scanNotificationCenter() {
-        guard enabled, AXIsProcessTrusted() else { return }
+    private func teleportWindowOffscreen(_ window: AXUIElement) {
+        var offscreen = CGPoint(x: 32000, y: -32000)
+        if let posVal = AXValueCreate(.cgPoint, &offscreen) {
+            _ = AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, posVal)
+        }
+    }
 
-        guard let ncApp = NSWorkspace.shared.runningApplications.first(where: {
-            $0.bundleIdentifier == "com.apple.notificationcenterui"
-        }) else {
+    private func isCompactBannerWindow(_ window: AXUIElement) -> Bool {
+        if let size = axSize(window, kAXSizeAttribute) {
+            // Notification Center's full sidebar is tall (> 500px); individual popup banner windows are compact (< 420px)
+            if size.height >= 28 && size.height <= 420 && size.width >= 160 && size.width <= 560 {
+                return true
+            }
+            if size.height > 480 {
+                return false
+            }
+        }
+        return false
+    }
+
+    private func dismissBannerElement(_ banner: AXUIElement, owningWindow: AXUIElement?) {
+        if let owningWindow {
+            teleportWindowOffscreen(owningWindow)
+        }
+
+        let closeKeywords = [
+            "close", "clear", "dismiss", "cancel",
+            "بستن", "پاک", "fermer", "schließen", "cerrar", "chiudi", "закрыть", "关闭", "閉じる", "닫기"
+        ]
+
+        // 1. Search custom AXActions (checking BOTH raw action name AND localized AXUIElementCopyActionDescription!)
+        //    and AXButtons across the banner subtree (depth 0..14)
+        if pressAXAction(on: banner, matching: closeKeywords, maxDepth: 14) {
             return
         }
 
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
-            let appElem = AXUIElementCreateApplication(ncApp.processIdentifier)
-            var windowsRef: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(appElem, kAXWindowsAttribute as CFString, &windowsRef) == .success,
-                  let windows = windowsRef as? [AXUIElement] else {
+        // 2. Try kAXCancelAction & kAXCloseButtonAttribute on banner
+        if AXUIElementPerformAction(banner, kAXCancelAction as CFString) == .success {
+            return
+        }
+        if pressCloseButtonAttribute(on: banner) {
+            return
+        }
+
+        // 3. Walk up parent chain to owningWindow and try custom Close actions / close button there too
+        if let owningWindow {
+            if pressAXAction(on: owningWindow, matching: closeKeywords, maxDepth: 14) {
                 return
             }
+            if AXUIElementPerformAction(owningWindow, kAXCancelAction as CFString) == .success {
+                return
+            }
+            _ = pressCloseButtonAttribute(on: owningWindow)
+        }
+    }
 
-            let now = Date()
-            // Prune old dedupe entries (> 60s)
-            self.seenTimestamps = self.seenTimestamps.filter { now.timeIntervalSince($0.value) < 60 }
+    private func pressCloseButtonAttribute(on element: AXUIElement) -> Bool {
+        var closeRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXCloseButtonAttribute as CFString, &closeRef) == .success,
+           let btn = closeRef {
+            return AXUIElementPerformAction(btn as! AXUIElement, kAXPressAction as CFString) == .success
+        }
+        return false
+    }
 
-            for window in windows {
-                let banners = self.findNotificationBanners(in: window, depth: 0, maxDepth: 6)
-                for banner in banners {
-                    guard let parsed = self.extractNotification(from: banner) else { continue }
-                    if let lastSeen = self.seenTimestamps[parsed.dedupeKey], now.timeIntervalSince(lastSeen) < 15 {
+    private func scanNotificationCenterSync(ncPID: pid_t, autoDismiss: Bool) {
+        let appElem = AXUIElementCreateApplication(ncPID)
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElem, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let windows = windowsRef as? [AXUIElement], !windows.isEmpty else {
+            return
+        }
+
+        let now = Date()
+        seenTimestamps = seenTimestamps.filter { now.timeIntervalSince($0.value) < 60 }
+
+        for window in windows {
+            let isCompactPopupWin = isCompactBannerWindow(window)
+
+            // Search deep (up to depth 16) for SwiftUI / AppKit notification banner elements
+            var banners = findNotificationBanners(in: window, depth: 0, maxDepth: 16)
+            if banners.isEmpty && isCompactPopupWin {
+                banners = [window]
+            }
+            guard !banners.isEmpty else { continue }
+
+            // If Notch-Only Mode is ON, immediately push compact popup windows off-screen before animation appears
+            if autoDismiss && isCompactPopupWin {
+                teleportWindowOffscreen(window)
+            }
+
+            for banner in banners {
+                if let parsed = extractNotification(from: banner) {
+                    if autoDismiss {
+                        dismissBannerElement(banner, owningWindow: isCompactPopupWin ? window : nil)
+                    }
+
+                    if let lastSeen = seenTimestamps[parsed.dedupeKey], now.timeIntervalSince(lastSeen) < 15 {
                         continue
                     }
-                    self.seenTimestamps[parsed.dedupeKey] = now
-                    if self.autoDismissMacBanner {
-                        // Immediately hide macOS's top-right banner so ONLY NotchPulse displays it
-                        _ = self.pressAXAction(on: banner, matching: ["close", "dismiss", "clear"])
-                        self.showPopup(parsed, axBanner: nil)
-                    } else {
-                        self.showPopup(parsed, axBanner: banner)
-                    }
-                    return
+                    seenTimestamps[parsed.dedupeKey] = now
+                    showPopup(parsed, axBanner: autoDismiss ? nil : banner)
+                } else if autoDismiss && isCompactPopupWin {
+                    // Window just spawned and text nodes are still mounting; keep it off-screen until the +22ms pass reads & closes it
+                    teleportWindowOffscreen(window)
                 }
             }
         }
@@ -391,26 +657,29 @@ final class NotificationService: ObservableObject {
 
     private func extractNotification(from banner: AXUIElement) -> CapturedNotification? {
         var texts: [String] = []
-        collectStaticTexts(in: banner, into: &texts, depth: 0, maxDepth: 7)
+        collectStaticTexts(in: banner, into: &texts, depth: 0, maxDepth: 14)
 
-        // Filter out noise strings like "Close", "Options", "now", "Reply"
-        let noise: Set<String> = ["close", "options", "reply", "now", "clear", "mark as read", "actions"]
+        let noise: Set<String> = [
+            "close", "options", "reply", "now", "clear", "clear all",
+            "mark as read", "actions", "notification center", "stack"
+        ]
         let cleaned = texts
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty && !noise.contains($0.lowercased()) }
 
-        guard !cleaned.isEmpty else { return nil }
-
-        // Determine app name from banner AXDescription or first matching running app
+        // Also check AXDescription on the banner itself (SwiftUI banners often pack "<App>, <Title>, <Body>" here immediately!)
         let desc = axString(banner, kAXDescriptionAttribute) ?? ""
+        if cleaned.isEmpty && desc.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return nil
+        }
+
         var appName = ""
         var bundleID = ""
         var appIcon: NSImage? = nil
 
-        // macOS banner description often starts with "<AppName>, <Title>, <Body>"
-        let descParts = desc.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-        if let firstPart = descParts.first, !firstPart.isEmpty {
-            if let matched = matchRunningApp(name: firstPart) {
+        let descParts = desc.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        if let firstPart = descParts.first {
+            if let matched = matchApp(name: firstPart) {
                 appName = matched.name
                 bundleID = matched.bundleID
                 appIcon = matched.icon
@@ -419,7 +688,7 @@ final class NotificationService: ObservableObject {
 
         if appName.isEmpty {
             for candidate in cleaned {
-                if let matched = matchRunningApp(name: candidate) {
+                if let matched = matchApp(name: candidate) {
                     appName = matched.name
                     bundleID = matched.bundleID
                     appIcon = matched.icon
@@ -429,17 +698,20 @@ final class NotificationService: ObservableObject {
         }
 
         if appName.isEmpty {
-            appName = descParts.first?.isEmpty == false ? descParts[0] : "Notification"
+            appName = descParts.first ?? "Notification"
             appIcon = NSImage(systemSymbolName: "bell.badge.fill", accessibilityDescription: nil)
         }
 
-        // Remove the app name itself from the text lines so Title & Body are crisp
-        let contentLines = cleaned.filter { $0.localizedCaseInsensitiveCompare(appName) != .orderedSame }
+        let sourceLines = !cleaned.isEmpty ? cleaned : Array(descParts.dropFirst())
+        let contentLines = sourceLines.filter { $0.localizedCaseInsensitiveCompare(appName) != .orderedSame }
         let title = contentLines.first ?? appName
         let subtitle = contentLines.count >= 3 ? contentLines[1] : ""
         let body = contentLines.count >= 3 ? contentLines[2] : (contentLines.count == 2 ? contentLines[1] : "")
+        let finalBody = body.isEmpty ? subtitle : body
 
-        let dedupe = "\(appName)|\(title)|\(body)"
+        guard !title.isEmpty || !finalBody.isEmpty else { return nil }
+
+        let dedupe = makeDedupeKey(title: title, body: finalBody)
         return CapturedNotification(
             id: UUID(),
             dedupeKey: dedupe,
@@ -448,10 +720,14 @@ final class NotificationService: ObservableObject {
             appIcon: appIcon,
             title: title,
             subtitle: subtitle,
-            body: body.isEmpty ? subtitle : body,
+            body: finalBody,
             date: Date(),
             isTest: false
         )
+    }
+
+    private func makeDedupeKey(title: String, body: String) -> String {
+        "\(title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())|\(body.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
     }
 
     private func collectStaticTexts(in element: AXUIElement, into out: inout [String], depth: Int, maxDepth: Int) {
@@ -462,6 +738,8 @@ final class NotificationService: ObservableObject {
                 out.append(val)
             } else if let title = axString(element, kAXTitleAttribute), !title.isEmpty {
                 out.append(title)
+            } else if let desc = axString(element, kAXDescriptionAttribute), !desc.isEmpty {
+                out.append(desc)
             }
         }
         var childrenRef: CFTypeRef?
@@ -474,14 +752,40 @@ final class NotificationService: ObservableObject {
         }
     }
 
-    private func pressAXAction(on element: AXUIElement, matching keywords: [String]) -> Bool {
-        // 1. Check custom AX actions directly on the banner (macOS puts Reply / Mark as Read here!)
+    /// Recursively searches `element` and its descendants for custom AXActions (checking BOTH action name
+    /// and `AXUIElementCopyActionDescription` for SwiftUI custom actions) as well as matching AXButtons.
+    private func pressAXAction(on element: AXUIElement, matching keywords: [String], maxDepth: Int) -> Bool {
+        if pressCustomActionRecursive(on: element, matching: keywords, depth: 0, maxDepth: maxDepth) {
+            return true
+        }
+        if let btn = findAXButton(in: element, matching: keywords, depth: 0, maxDepth: maxDepth) {
+            return AXUIElementPerformAction(btn, kAXPressAction as CFString) == .success
+        }
+        return false
+    }
+
+    private func pressCustomActionRecursive(on element: AXUIElement, matching keywords: [String], depth: Int, maxDepth: Int) -> Bool {
+        guard depth <= maxDepth else { return false }
+
+        let forbiddenActions = ["axpress", "axshowmenu", "mute", "turn off"]
         var actionsRef: CFArray?
         if AXUIElementCopyActionNames(element, &actionsRef) == .success,
            let actions = actionsRef as? [String] {
             for act in actions {
-                let lower = act.lowercased()
-                if keywords.contains(where: { lower.contains($0) }) {
+                let lowerName = act.lowercased()
+                if forbiddenActions.contains(lowerName) { continue }
+
+                var descStr = ""
+                var descRef: CFString?
+                if AXUIElementCopyActionDescription(element, act as CFString, &descRef) == .success,
+                   let d = descRef as String? {
+                    descStr = d.lowercased()
+                }
+
+                let combined = lowerName + " " + descStr
+                if forbiddenActions.contains(where: { descStr.contains($0) }) { continue }
+
+                if keywords.contains(where: { combined.contains($0) }) {
                     if AXUIElementPerformAction(element, act as CFString) == .success {
                         return true
                     }
@@ -489,9 +793,15 @@ final class NotificationService: ObservableObject {
             }
         }
 
-        // 2. Otherwise search child AXButtons
-        if let btn = findAXButton(in: element, matching: keywords, depth: 0, maxDepth: 7) {
-            return AXUIElementPerformAction(btn, kAXPressAction as CFString) == .success
+        var childrenRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+              let children = childrenRef as? [AXUIElement] else {
+            return false
+        }
+        for child in children {
+            if pressCustomActionRecursive(on: child, matching: keywords, depth: depth + 1, maxDepth: maxDepth) {
+                return true
+            }
         }
         return false
     }
@@ -502,7 +812,8 @@ final class NotificationService: ObservableObject {
             let texts = [
                 axString(element, kAXTitleAttribute),
                 axString(element, kAXDescriptionAttribute),
-                axString(element, kAXHelpAttribute)
+                axString(element, kAXHelpAttribute),
+                axString(element, kAXIdentifierAttribute)
             ].compactMap { $0?.lowercased() }
             if texts.contains(where: { t in keywords.contains(where: { t.contains($0) }) }) {
                 return element
@@ -542,7 +853,16 @@ final class NotificationService: ObservableObject {
         return s
     }
 
-    private func matchRunningApp(name: String) -> (name: String, bundleID: String, icon: NSImage?)? {
+    private func axSize(_ element: AXUIElement, _ attr: String) -> CGSize? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attr as CFString, &ref) == .success,
+              let val = ref, CFGetTypeID(val) == AXValueGetTypeID() else { return nil }
+        var sz = CGSize.zero
+        guard AXValueGetValue(val as! AXValue, .cgSize, &sz) else { return nil }
+        return sz
+    }
+
+    private func matchApp(name: String) -> (name: String, bundleID: String, icon: NSImage?)? {
         let lower = name.lowercased()
         for app in NSWorkspace.shared.runningApplications {
             guard let loc = app.localizedName, !loc.isEmpty else { continue }
@@ -553,7 +873,7 @@ final class NotificationService: ObservableObject {
         return nil
     }
 
-    // MARK: - Option 2: Zero-Flash macOS NotificationCenter SQLite DB Reader (Works with DND / Banners OFF)
+    // MARK: - Event-Driven Zero-Flash SQLite WAL Reader (Works with DND / Banners OFF)
 
     func openFullDiskAccessSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
@@ -562,9 +882,13 @@ final class NotificationService: ObservableObject {
     }
 
     func checkDatabaseAccess() {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        scanQueue.async { [weak self] in
             guard let self else { return }
-            let readable = self.resolveNotificationDBPath() != nil
+            let path = self.resolveNotificationDBPath()
+            if let path {
+                self.installDBFileWatchersIfNeeded(dbPath: path)
+            }
+            let readable = path != nil
             DispatchQueue.main.async {
                 self.canReadNotificationDB = readable
             }
@@ -574,11 +898,9 @@ final class NotificationService: ObservableObject {
     private func resolveNotificationDBPath() -> String? {
         var candidates: [String] = []
 
-        // macOS 15+ / 26+ / 27+ location
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         candidates.append("\(home)/Library/Group Containers/group.com.apple.usernoted/db2/db")
 
-        // macOS 12–14 location via DARWIN_USER_DIR
         var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
         let len = confstr(_CS_DARWIN_USER_DIR, &buf, buf.count)
         if len > 0 {
@@ -589,7 +911,7 @@ final class NotificationService: ObservableObject {
         for path in candidates {
             if FileManager.default.isReadableFile(atPath: path) {
                 var db: OpaquePointer?
-                if sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK {
+                if sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK {
                     sqlite3_close(db)
                     return path
                 }
@@ -598,68 +920,67 @@ final class NotificationService: ObservableObject {
         return nil
     }
 
-    private func scanNotificationDatabase() {
-        guard enabled else { return }
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self, let dbPath = self.resolveNotificationDBPath() else {
-                DispatchQueue.main.async { self?.canReadNotificationDB = false }
-                return
-            }
-            if !self.canReadNotificationDB {
-                DispatchQueue.main.async { self.canReadNotificationDB = true }
-            }
+    private func scanNotificationDatabaseSync(force: Bool) {
+        guard let dbPath = watchedDBPath ?? resolveNotificationDBPath() else {
+            DispatchQueue.main.async { self.canReadNotificationDB = false }
+            return
+        }
+        if !canReadNotificationDB {
+            DispatchQueue.main.async { self.canReadNotificationDB = true }
+        }
 
-            var db: OpaquePointer?
-            guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db else { return }
-            defer { sqlite3_close(db) }
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK, let db else { return }
+        defer { sqlite3_close(db) }
 
-            // On first poll, initialize watermark to current max rec_id so old notifications don't pop up
-            if self.lastDBRecID < 0 {
-                var stmt: OpaquePointer?
-                if sqlite3_prepare_v2(db, "SELECT COALESCE(MAX(rec_id), 0) FROM record", -1, &stmt, nil) == SQLITE_OK {
-                    if sqlite3_step(stmt) == SQLITE_ROW {
-                        self.lastDBRecID = sqlite3_column_int64(stmt, 0)
-                    }
-                    sqlite3_finalize(stmt)
-                }
-                return
-            }
+        // Read latest WAL frames immediately without waiting for checkpoint
+        sqlite3_exec(db, "PRAGMA read_uncommitted = 1;", nil, nil, nil)
 
-            let sql = """
-            SELECT r.rec_id, a.identifier, r.data
-            FROM record r
-            JOIN app a ON r.app_id = a.app_id
-            WHERE r.rec_id > ?
-            ORDER BY r.rec_id ASC
-            LIMIT 10
-            """
+        if lastDBRecID < 0 {
             var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
-            defer { sqlite3_finalize(stmt) }
-            sqlite3_bind_int64(stmt, 1, self.lastDBRecID)
-
-            let now = Date()
-            self.seenTimestamps = self.seenTimestamps.filter { now.timeIntervalSince($0.value) < 60 }
-
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                let recID = sqlite3_column_int64(stmt, 0)
-                if recID > self.lastDBRecID {
-                    self.lastDBRecID = recID
+            if sqlite3_prepare_v2(db, "SELECT COALESCE(MAX(rec_id), 0) FROM record", -1, &stmt, nil) == SQLITE_OK {
+                if sqlite3_step(stmt) == SQLITE_ROW {
+                    lastDBRecID = sqlite3_column_int64(stmt, 0)
                 }
-
-                let bundleID = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
-                guard let blobPtr = sqlite3_column_blob(stmt, 2) else { continue }
-                let blobLen = Int(sqlite3_column_bytes(stmt, 2))
-                guard blobLen > 0 else { continue }
-                let plistData = Data(bytes: blobPtr, count: blobLen)
-
-                guard let parsed = self.parseNotificationPlist(plistData, bundleID: bundleID) else { continue }
-                if let lastSeen = self.seenTimestamps[parsed.dedupeKey], now.timeIntervalSince(lastSeen) < 15 {
-                    continue
-                }
-                self.seenTimestamps[parsed.dedupeKey] = now
-                self.showPopup(parsed, axBanner: nil)
+                sqlite3_finalize(stmt)
             }
+            return
+        }
+
+        let sql = """
+        SELECT r.rec_id, a.identifier, r.data
+        FROM record r
+        JOIN app a ON r.app_id = a.app_id
+        WHERE r.rec_id > ?
+        ORDER BY r.rec_id ASC
+        LIMIT 10
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, lastDBRecID)
+
+        let now = Date()
+        seenTimestamps = seenTimestamps.filter { now.timeIntervalSince($0.value) < 60 }
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let recID = sqlite3_column_int64(stmt, 0)
+            if recID > lastDBRecID {
+                lastDBRecID = recID
+            }
+
+            let bundleID = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+            guard let blobPtr = sqlite3_column_blob(stmt, 2) else { continue }
+            let blobLen = Int(sqlite3_column_bytes(stmt, 2))
+            guard blobLen > 0 else { continue }
+            let plistData = Data(bytes: blobPtr, count: blobLen)
+
+            guard let parsed = parseNotificationPlist(plistData, bundleID: bundleID) else { continue }
+            if let lastSeen = seenTimestamps[parsed.dedupeKey], now.timeIntervalSince(lastSeen) < 15 {
+                continue
+            }
+            seenTimestamps[parsed.dedupeKey] = now
+            showPopup(parsed, axBanner: nil)
         }
     }
 
@@ -687,7 +1008,7 @@ final class NotificationService: ObservableObject {
 
         let displayTitle = title.isEmpty ? appName : title
         let displayBody = body.isEmpty ? subtitle : body
-        let dedupe = "\(appName)|\(displayTitle)|\(displayBody)"
+        let dedupe = makeDedupeKey(title: displayTitle, body: displayBody)
 
         return CapturedNotification(
             id: UUID(),
@@ -704,6 +1025,6 @@ final class NotificationService: ObservableObject {
     }
 
     private func findAppIcon(named name: String) -> NSImage? {
-        matchRunningApp(name: name)?.icon
+        matchApp(name: name)?.icon
     }
 }

@@ -4,21 +4,93 @@ struct NotificationsTabView: View {
     @EnvironmentObject var notificationService: NotificationService
     @EnvironmentObject var appState: AppState
 
+    private var isNotchOnly: Bool {
+        appState.prefs.autoDismissMacBanner
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Recent Notifications (\(notificationService.recentNotifications.count))")
+        VStack(alignment: .leading, spacing: 7) {
+            // Header + 1-Click "Notch-Only (Hide System Popup)" Toggle + Test + Clear
+            HStack(spacing: 8) {
+                Text("Alerts (\(notificationService.recentNotifications.count))")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.65))
+                    .foregroundStyle(.white.opacity(0.75))
+
                 Spacer()
+
+                // Active / Deactive Notch-Only System Banner Blocker
+                Button {
+                    let next = !appState.prefs.autoDismissMacBanner
+                    appState.updatePreferences { $0.autoDismissMacBanner = next }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: isNotchOnly ? "bell.badge.slash.fill" : "bell.badge")
+                            .font(.system(size: 9.5, weight: .bold))
+                        Text(isNotchOnly ? "Notch-Only: ON" : "Notch-Only: OFF")
+                            .font(.system(size: 10, weight: .bold))
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule().fill(isNotchOnly ? Color.green.opacity(0.22) : Color.white.opacity(0.08))
+                    )
+                    .overlay(
+                        Capsule().stroke(isNotchOnly ? Color.green.opacity(0.55) : Color.white.opacity(0.12), lineWidth: 1)
+                    )
+                    .foregroundStyle(isNotchOnly ? .green : .white.opacity(0.65))
+                }
+                .buttonStyle(.plain)
+                .help("When ON, suppresses macOS top-right notification popups so alerts show ONLY in the Notch")
+
+                Button {
+                    appState.isPinned = false
+                    appState.setDisplayState(.idle)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                        notificationService.sendTestNotification()
+                    }
+                } label: {
+                    Text("Test")
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Capsule().fill(Color.cyan.opacity(0.18)))
+                        .foregroundStyle(.cyan)
+                }
+                .buttonStyle(.plain)
+
                 if !notificationService.recentNotifications.isEmpty {
-                    Button("Clear All") {
+                    Button("Clear") {
                         notificationService.recentNotifications.removeAll()
                     }
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(.white.opacity(0.55))
                     .buttonStyle(.plain)
                 }
+            }
+
+            if isNotchOnly && !notificationService.isAccessibilityTrusted {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.orange)
+                    Text("Grant Accessibility so NotchPulse can block macOS system popups instantly.")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .lineLimit(1)
+                    Spacer()
+                    Button("Grant") {
+                        notificationService.requestAccessibilityPermission()
+                    }
+                    .font(.system(size: 9.5, weight: .bold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(Color.orange))
+                    .foregroundStyle(.black)
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(RoundedRectangle(cornerRadius: 7).fill(Color.orange.opacity(0.14)))
             }
 
             if notificationService.recentNotifications.isEmpty {
@@ -29,7 +101,7 @@ struct NotificationsTabView: View {
                     Text("No notifications yet")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.white.opacity(0.55))
-                    Text("Incoming Telegram, Messages, Discord, and system notifications will appear here.")
+                    Text("Incoming Telegram, Messages, Discord, and system notifications appear instantly under the Notch.")
                         .font(.system(size: 10))
                         .foregroundStyle(.white.opacity(0.4))
                         .multilineTextAlignment(.center)

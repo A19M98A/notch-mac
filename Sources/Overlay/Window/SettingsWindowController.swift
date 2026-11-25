@@ -43,6 +43,7 @@ final class SettingsWindowController: NSWindowController {
             .environmentObject(appState.vpnService)
             .environmentObject(appState.perAppMixer)
             .environmentObject(appState.mediaService)
+            .environmentObject(appState.updateService)
 
         let hosting = NSHostingView(rootView: root)
         hosting.frame = NSRect(x: 0, y: 0, width: 520, height: 550)
@@ -80,6 +81,7 @@ struct NotchSettingsView: View {
     @EnvironmentObject var vpnService: VPNService
     @EnvironmentObject var perAppMixer: PerAppAudioMixer
     @EnvironmentObject var mediaService: MediaRemoteService
+    @EnvironmentObject var updateService: UpdateService
 
     @State private var section: SettingsSection = .modules
     @State private var axTrusted: Bool = AXIsProcessTrusted()
@@ -137,6 +139,11 @@ struct NotchSettingsView: View {
                                         .font(.system(size: 11, weight: .semibold))
                                     Text(sec.rawValue)
                                         .font(.system(size: 11, weight: .semibold))
+                                    if sec == .about && updateService.hasUpdateAvailable {
+                                        Circle()
+                                            .fill(Color.green)
+                                            .frame(width: 6, height: 6)
+                                    }
                                 }
                                 .padding(.horizontal, 11)
                                 .padding(.vertical, 6)
@@ -304,7 +311,7 @@ struct NotchSettingsView: View {
                             ),
                             range: 2...8
                         )
-                        toggleRow("Auto-Hide macOS Top-Right Banner", isOn: Binding(
+                        toggleRow("Notch-Only Mode (Hide macOS System Popup)", isOn: Binding(
                             get: { appState.prefs.autoDismissMacBanner },
                             set: { v in appState.updatePreferences { $0.autoDismissMacBanner = v } }
                         ))
@@ -312,6 +319,13 @@ struct NotchSettingsView: View {
                             get: { appState.prefs.readNotificationDatabase },
                             set: { v in appState.updatePreferences { $0.readNotificationDatabase = v } }
                         ))
+                        if appState.prefs.readNotificationDatabase {
+                            Text("For zero macOS banners: grant Full Disk Access, then enable Do Not Disturb or set app Alert Style to None (keep Show in Notification Center ON).")
+                                .font(.system(size: 10))
+                                .foregroundColor(.white.opacity(0.45))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.top, -4)
+                        }
                     }
                     toggleRow("Show Network Speed on Hover", isOn: Binding(
                         get: { appState.prefs.showNetworkSpeedOnHover },
@@ -515,14 +529,18 @@ struct NotchSettingsView: View {
                 Text("NotchPulse")
                     .font(.system(size: 22, weight: .bold))
                     .foregroundStyle(.white)
-                Text("Version 1.1.0 · Universal (Apple Silicon & Intel) · macOS 12+")
+                Text("Version \(updateService.currentVersion) · Universal (Apple Silicon & Intel) · macOS 12+")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.55))
             }
 
+            // Built-in GitHub Releases Auto-Updater Card
+            updateCard
+                .padding(.horizontal, 22)
+
             Text("A lightweight, native macOS Dynamic Notch overlay featuring multi-source media controls, per-app volume mixing, real-time microphone DSP effects, live network speed, standalone VPN & split-tunnel manager, Pomodoro timer, and persistent clipboard history.")
-                .font(.system(size: 12))
-                .foregroundStyle(.white.opacity(0.75))
+                .font(.system(size: 11.5))
+                .foregroundStyle(.white.opacity(0.72))
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 28)
 
@@ -573,6 +591,193 @@ struct NotchSettingsView: View {
 
             Spacer()
         }
+    }
+
+    @ViewBuilder
+    private var updateCard: some View {
+        VStack(spacing: 9) {
+            // Update Channel Picker: Stable vs Debug
+            HStack(spacing: 8) {
+                Text("Update Channel")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.65))
+                Spacer()
+                HStack(spacing: 3) {
+                    ForEach(UpdateChannel.allCases) { ch in
+                        let selected = updateService.channel == ch
+                        let accent: Color = ch == .debug ? .orange : .cyan
+                        Button {
+                            guard updateService.channel != ch else { return }
+                            appState.updatePreferences { $0.updateChannel = ch.rawValue }
+                            updateService.checkForUpdates()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: ch.icon)
+                                    .font(.system(size: 9.5, weight: .bold))
+                                Text(ch.title)
+                                    .font(.system(size: 10.5, weight: .bold))
+                            }
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .background(Capsule().fill(selected ? accent.opacity(0.22) : Color.clear))
+                            .overlay(Capsule().stroke(selected ? accent.opacity(0.6) : Color.clear, lineWidth: 1))
+                            .foregroundStyle(selected ? accent : .white.opacity(0.55))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(2)
+                .background(Capsule().fill(Color.white.opacity(0.06)))
+            }
+
+            Divider().overlay(Color.white.opacity(0.07))
+
+            switch updateService.state {
+            case .idle:
+                HStack {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(updateService.channel == .debug ? .orange : .cyan)
+                        Text(updateService.channel == .debug ? "Debug & Pre-release Builds" : "Stable Releases")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundStyle(.white)
+                    }
+                    Spacer()
+                    Button("Check for Updates") {
+                        updateService.checkForUpdates()
+                    }
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(.black)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 5)
+                    .background(Capsule().fill(updateService.channel == .debug ? Color.orange : Color.cyan))
+                    .buttonStyle(.plain)
+                }
+
+            case .checking:
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Checking \(updateService.channel.title.lowercased()) releases...")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.75))
+                    Spacer()
+                }
+
+            case .upToDate(let ver):
+                HStack {
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 13))
+                            .foregroundStyle(.green)
+                        Text("v\(ver) is up to date (\(updateService.channel.title))")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundStyle(.white)
+                    }
+                    Spacer()
+                    Button("Check Again") {
+                        updateService.checkForUpdates()
+                    }
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.8))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(Color.white.opacity(0.12)))
+                    .buttonStyle(.plain)
+                }
+
+            case .available(let release):
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 6) {
+                        Image(systemName: release.isPrerelease ? "ladybug.fill" : "sparkles")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(release.isPrerelease ? .orange : .green)
+                        Text("v\(release.version)")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(.white)
+                        Text(release.isPrerelease ? "DEBUG" : "STABLE")
+                            .font(.system(size: 9, weight: .heavy))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Capsule().fill((release.isPrerelease ? Color.orange : Color.green).opacity(0.22)))
+                            .foregroundStyle(release.isPrerelease ? .orange : .green)
+                        Spacer()
+                        Button("Notes") {
+                            NSWorkspace.shared.open(release.htmlURL)
+                        }
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.75))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Capsule().fill(Color.white.opacity(0.10)))
+                        .buttonStyle(.plain)
+
+                        Button("Update & Relaunch") {
+                            updateService.downloadAndInstall(release)
+                        }
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(release.isPrerelease ? Color.orange : Color.green))
+                        .buttonStyle(.plain)
+                    }
+                }
+
+            case .downloading(let progress):
+                VStack(spacing: 6) {
+                    HStack {
+                        Text("Downloading update... \(Int(round(progress * 100)))%")
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.85))
+                        Spacer()
+                        Button("Cancel") {
+                            updateService.cancelDownload()
+                        }
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.7))
+                        .buttonStyle(.plain)
+                    }
+                    ProgressView(value: progress, total: 1.0)
+                        .tint(.cyan)
+                }
+
+            case .installing:
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Installing update & relaunching NotchPulse...")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(.green)
+                    Spacer()
+                }
+
+            case .error(let msg):
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.orange)
+                    Text(msg)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .lineLimit(2)
+                    Spacer()
+                    Button("Retry") {
+                        updateService.checkForUpdates()
+                    }
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(Color.white.opacity(0.12)))
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.06)))
     }
 
     // MARK: - UI Helpers

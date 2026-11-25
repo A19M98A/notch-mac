@@ -57,6 +57,7 @@ final class NotchWindowController: NSWindowController {
         let rootView = NotchRootView()
             .environmentObject(appState)
             .environmentObject(appState.systemAudio)
+            .environmentObject(appState.pairPlayService)
             .environmentObject(appState.inputAudio)
             .environmentObject(appState.perAppMixer)
             .environmentObject(appState.mediaService)

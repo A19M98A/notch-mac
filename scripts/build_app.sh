@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BIN_NAME="Overlay"
 APP_NAME="NotchPulse"
-VERSION="1.1.0"
+VERSION="${VERSION:-1.1.0}"
 BUILD_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 RELEASE_ZIP="$BUILD_DIR/$APP_NAME-$VERSION-macOS-Universal.zip"
@@ -35,6 +35,10 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 lipo -create -output "$APP_BUNDLE/Contents/MacOS/$APP_NAME" "$ARM64_BIN" "$X86_BIN"
 chmod +x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
+if [ -f "$ROOT_DIR/Resources/AppIcon.icns" ]; then
+    cp "$ROOT_DIR/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+fi
+
 cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -44,6 +48,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
     <string>en</string>
     <key>CFBundleExecutable</key>
     <string>$APP_NAME</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.amin.NotchPulse</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -74,8 +80,20 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "Signing $APP_BUNDLE (ad-hoc)..."
-codesign --force --deep --sign - "$APP_BUNDLE"
+SIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
+if [ -z "$SIGN_IDENTITY" ]; then
+    if security find-identity -v -p codesigning 2>/dev/null | grep -q '"NotchPulse Dev"'; then
+        SIGN_IDENTITY="NotchPulse Dev"
+    fi
+fi
+
+if [ -n "$SIGN_IDENTITY" ]; then
+    echo "Signing $APP_BUNDLE with identity: $SIGN_IDENTITY (preserves macOS permissions across updates)..."
+    codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
+else
+    echo "Signing $APP_BUNDLE (ad-hoc)..."
+    codesign --force --deep --sign - "$APP_BUNDLE"
+fi
 
 echo "Creating release archive $RELEASE_ZIP..."
 ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "$RELEASE_ZIP"
