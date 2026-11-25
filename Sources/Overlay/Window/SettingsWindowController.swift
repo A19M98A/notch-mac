@@ -291,6 +291,15 @@ struct NotchSettingsView: View {
                         ),
                         range: 0.10...1.00
                     )
+                    sliderRow(
+                        title: "File Drag Open Delay",
+                        valueText: String(format: "%.2fs", appState.prefs.fileDragOpenDelay),
+                        value: Binding(
+                            get: { appState.prefs.fileDragOpenDelay },
+                            set: { v in appState.updatePreferences { $0.fileDragOpenDelay = v } }
+                        ),
+                        range: 0.15...1.50
+                    )
                 }
                 .padding(14)
                 .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.06)))

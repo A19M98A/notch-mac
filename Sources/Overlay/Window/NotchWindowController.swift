@@ -14,6 +14,7 @@ final class NotchWindowController: NSWindowController {
     private var globalMouseMonitor: Any?
     private var localMouseMonitor: Any?
     private var collapseWorkItem: DispatchWorkItem?
+    private var dragExpandWorkItem: DispatchWorkItem?
     private var cancellables = Set<AnyCancellable>()
 
     static let windowWidth: CGFloat = 680
@@ -132,13 +133,18 @@ final class NotchWindowController: NSWindowController {
     }
 
     private func installMouseMonitors() {
-        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .leftMouseDragged]) { [weak self] event in
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
             self?.handleMouseEvent(event)
         }
-        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged]) { [weak self] event in
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
             self?.handleMouseEvent(event)
             return event
         }
+    }
+
+    private func cancelPendingFileDragOpen() {
+        dragExpandWorkItem?.cancel()
+        dragExpandWorkItem = nil
     }
 
     private func isDraggingFileFromFinderOrApp() -> Bool {
@@ -155,27 +161,67 @@ final class NotchWindowController: NSWindowController {
         let mouseLocation = NSEvent.mouseLocation // Screen coordinates (origin bottom-left)
         let frame = window.frame
 
-        // Auto-open Clips -> Files shelf when dragging a file near the top-center notch!
+        if event.type == .leftMouseUp {
+            cancelPendingFileDragOpen()
+        }
+
+        // Hold-near-notch delay before auto-opening Clips -> Files shelf during file drag
         if event.type == .leftMouseDragged && isDraggingFileFromFinderOrApp() {
+            let triggerW: CGFloat = appState.displayState == .expanded ? (Self.expandedWidth + 24) : 360
+            let triggerH: CGFloat = appState.displayState == .expanded ? (CGFloat(appState.prefs.expandedHeight) + 24) : 84
             let dragTriggerRect = NSRect(
-                x: frame.midX - 240,
-                y: frame.maxY - 120,
-                width: 480,
-                height: 120
+                x: frame.midX - triggerW / 2,
+                y: frame.maxY - triggerH,
+                width: triggerW,
+                height: triggerH
             )
             if dragTriggerRect.contains(mouseLocation) {
                 collapseWorkItem?.cancel()
                 collapseWorkItem = nil
-                window.ignoresMouseEvents = false
-                if appState.enabledTabs.contains(.clipboard) {
-                    appState.selectedTab = .clipboard
-                    appState.clipboardService.clipsMode = .files
+
+                if appState.displayState == .expanded {
+                    window.ignoresMouseEvents = false
+                    return
                 }
-                if appState.displayState != .expanded {
-                    appState.setDisplayState(.expanded)
+
+                // Show subtle peek feedback first while holding, then expand only after fileDragOpenDelay
+                if appState.displayState == .idle {
+                    appState.setDisplayState(.peek)
+                }
+
+                if dragExpandWorkItem == nil {
+                    let delay = max(0.15, appState.prefs.fileDragOpenDelay)
+                    let work = DispatchWorkItem { [weak self] in
+                        guard let self, let win = self.window else { return }
+                        self.dragExpandWorkItem = nil
+                        // Confirm user is STILL holding left mouse button inside the notch trigger zone with a file
+                        guard (NSEvent.pressedMouseButtons & 1) != 0,
+                              self.isDraggingFileFromFinderOrApp() else {
+                            return
+                        }
+                        let curLoc = NSEvent.mouseLocation
+                        let curFrame = win.frame
+                        let checkRect = NSRect(x: curFrame.midX - 190, y: curFrame.maxY - 90, width: 380, height: 90)
+                        guard checkRect.contains(curLoc) else { return }
+
+                        win.ignoresMouseEvents = false
+                        if self.appState.enabledTabs.contains(.clipboard) {
+                            self.appState.selectedTab = .clipboard
+                            self.appState.clipboardService.clipsMode = .files
+                        }
+                        if self.appState.displayState != .expanded {
+                            self.appState.setDisplayState(.expanded)
+                        }
+                    }
+                    dragExpandWorkItem = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
                 }
                 return
+            } else {
+                cancelPendingFileDragOpen()
             }
+        } else if event.type != .leftMouseDragged {
+            cancelPendingFileDragOpen()
         }
 
         let state = appState.displayState

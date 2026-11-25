@@ -53,6 +53,7 @@ struct NotchPreferences: Codable, Equatable {
     var idleHeight: Double = 14.0            // 10 ... 22
     var expandedHeight: Double = 246.0       // 220 ... 310
     var collapseDelay: Double = 0.28         // 0.10 ... 1.00
+    var fileDragOpenDelay: Double = 0.50     // 0.15 ... 1.50s hold near notch before opening Files shelf
     var showNetworkSpeedOnHover: Bool = true
     var showVolumeHUD: Bool = true
     var showVPNDotInIdle: Bool = true
@@ -64,6 +65,29 @@ struct NotchPreferences: Codable, Equatable {
     var autoSwitchSystemMic: Bool = true
     var launchAtLogin: Bool = false
     var updateChannel: String = "stable"
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabledTabs = try c.decodeIfPresent([String].self, forKey: .enabledTabs) ?? NotchTab.allCases.map { $0.rawValue }
+        notchOpacity = try c.decodeIfPresent(Double.self, forKey: .notchOpacity) ?? 0.72
+        idleHeight = try c.decodeIfPresent(Double.self, forKey: .idleHeight) ?? 14.0
+        expandedHeight = try c.decodeIfPresent(Double.self, forKey: .expandedHeight) ?? 246.0
+        collapseDelay = try c.decodeIfPresent(Double.self, forKey: .collapseDelay) ?? 0.28
+        fileDragOpenDelay = try c.decodeIfPresent(Double.self, forKey: .fileDragOpenDelay) ?? 0.50
+        showNetworkSpeedOnHover = try c.decodeIfPresent(Bool.self, forKey: .showNetworkSpeedOnHover) ?? true
+        showVolumeHUD = try c.decodeIfPresent(Bool.self, forKey: .showVolumeHUD) ?? true
+        showVPNDotInIdle = try c.decodeIfPresent(Bool.self, forKey: .showVPNDotInIdle) ?? true
+        showNotificationPopups = try c.decodeIfPresent(Bool.self, forKey: .showNotificationPopups) ?? true
+        notificationDuration = try c.decodeIfPresent(Double.self, forKey: .notificationDuration) ?? 3.0
+        autoDismissMacBanner = try c.decodeIfPresent(Bool.self, forKey: .autoDismissMacBanner) ?? true
+        readNotificationDatabase = try c.decodeIfPresent(Bool.self, forKey: .readNotificationDatabase) ?? true
+        clipboardLimit = try c.decodeIfPresent(Int.self, forKey: .clipboardLimit) ?? 100
+        autoSwitchSystemMic = try c.decodeIfPresent(Bool.self, forKey: .autoSwitchSystemMic) ?? true
+        launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
+        updateChannel = try c.decodeIfPresent(String.self, forKey: .updateChannel) ?? "stable"
+    }
 }
 
 final class AppState: ObservableObject {
