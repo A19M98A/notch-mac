@@ -506,24 +506,11 @@ struct NotchSettingsView: View {
         VStack(spacing: 16) {
             Spacer(minLength: 8)
 
-            ZStack {
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [Color.cyan.opacity(0.35), Color.purple.opacity(0.35)],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                    .frame(width: 72, height: 72)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 20, style: .continuous)
-                            .stroke(Color.white.opacity(0.22), lineWidth: 1)
-                    )
-                Image(systemName: "waveform")
-                    .font(.system(size: 32, weight: .bold))
-                    .foregroundStyle(.white)
-            }
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 82, height: 82)
+                .shadow(color: .black.opacity(0.45), radius: 10, y: 4)
 
             VStack(spacing: 4) {
                 Text("NotchPulse")

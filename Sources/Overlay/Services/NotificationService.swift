@@ -602,16 +602,18 @@ final class NotificationService: ObservableObject {
         seenTimestamps = seenTimestamps.filter { now.timeIntervalSince($0.value) < 60 }
 
         for window in windows {
-            let isCompactPopupWin = isCompactBannerWindow(window)
-
-            // Search deep (up to depth 16) for SwiftUI / AppKit notification banner elements
-            var banners = findNotificationBanners(in: window, depth: 0, maxDepth: 16)
-            if banners.isEmpty && isCompactPopupWin {
-                banners = [window]
+            let winSubrole = (axString(window, kAXSubroleAttribute) ?? "").lowercased()
+            let winRole = (axString(window, kAXRoleAttribute) ?? "").lowercased()
+            if winSubrole.contains("widget") || winRole.contains("widget") {
+                continue
             }
+
+            // Strictly match real AXNotificationCenterBanner / AXNotificationCenterAlert elements only
+            // (never treat macOS Desktop Widgets like Calendar "No Events Today" as notifications!)
+            let banners = findNotificationBanners(in: window, depth: 0, maxDepth: 16)
             guard !banners.isEmpty else { continue }
 
-            // If Notch-Only Mode is ON, immediately push compact popup windows off-screen before animation appears
+            let isCompactPopupWin = isCompactBannerWindow(window)
             if autoDismiss && isCompactPopupWin {
                 teleportWindowOffscreen(window)
             }
@@ -628,7 +630,6 @@ final class NotificationService: ObservableObject {
                     seenTimestamps[parsed.dedupeKey] = now
                     showPopup(parsed, axBanner: autoDismiss ? nil : banner)
                 } else if autoDismiss && isCompactPopupWin {
-                    // Window just spawned and text nodes are still mounting; keep it off-screen until the +22ms pass reads & closes it
                     teleportWindowOffscreen(window)
                 }
             }
@@ -638,6 +639,9 @@ final class NotificationService: ObservableObject {
     private func findNotificationBanners(in element: AXUIElement, depth: Int, maxDepth: Int) -> [AXUIElement] {
         guard depth <= maxDepth else { return [] }
         let subrole = axString(element, kAXSubroleAttribute) ?? ""
+        if subrole.lowercased().contains("widget") {
+            return []
+        }
         if subrole == "AXNotificationCenterBanner" || subrole == "AXNotificationCenterAlert" {
             return [element]
         }
