@@ -9,9 +9,15 @@ let package = Package(
     products: [
         .executable(name: "Overlay", targets: ["Overlay"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", from: "1.2.0")
+    ],
     targets: [
         .executableTarget(
             name: "Overlay",
+            dependencies: [
+                .product(name: "SwiftTerm", package: "SwiftTerm")
+            ],
             path: "Sources/Overlay",
             linkerSettings: [
                 .linkedFramework("AppKit"),

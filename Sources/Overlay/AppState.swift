@@ -123,6 +123,7 @@ final class AppState: ObservableObject {
     let timerService = TimerService()
     let clipboardService = ClipboardService()
     let updateService = UpdateService()
+    let terminalService = TerminalService()
 
     private var cancellables = Set<AnyCancellable>()
     private var hudDismissWorkItem: DispatchWorkItem?

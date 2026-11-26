@@ -10,6 +10,7 @@ struct NotchRootView: View {
     @EnvironmentObject var vpnService: VPNService
     @EnvironmentObject var networkMonitor: NetworkMonitorService
     @EnvironmentObject var timerService: TimerService
+    @EnvironmentObject var terminalService: TerminalService
 
     @State private var alarmPulse: Bool = false
 
@@ -399,13 +400,19 @@ struct NotchRootView: View {
                     .frame(width: 5, height: 5)
             }
 
+            if !terminalService.tabs.isEmpty {
+                Circle()
+                    .fill(Color.indigo)
+                    .frame(width: 5, height: 5)
+            }
+
             if timerService.isActiveInNotch {
                 Circle()
                     .fill(Color.orange)
                     .frame(width: 5, height: 5)
             }
 
-            if !(appState.prefs.showVPNDotInIdle && vpnService.liveStatus.connected) && !mediaService.track.isPlaying && !timerService.isActiveInNotch && !pairPlay.isActive && !virtualMic.isActive {
+            if !(appState.prefs.showVPNDotInIdle && vpnService.liveStatus.connected) && !mediaService.track.isPlaying && !timerService.isActiveInNotch && !pairPlay.isActive && !virtualMic.isActive && terminalService.tabs.isEmpty {
                 Capsule()
                     .fill(Color.white.opacity(0.28))
                     .frame(width: 24, height: 3)
@@ -615,6 +622,22 @@ struct NotchRootView: View {
                 }
 
                 Spacer(minLength: 4)
+
+                Button {
+                    appState.isPinned = false
+                    appState.setDisplayState(.idle)
+                    TerminalWindowController.toggle(appState: appState)
+                } label: {
+                    let hasTabs = !terminalService.tabs.isEmpty
+                    let visible = terminalService.isWindowVisible
+                    Image(systemName: "terminal.fill")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundColor(visible ? .cyan : (hasTabs ? .green : Color.white.opacity(0.65)))
+                        .padding(6)
+                        .background(Circle().fill(visible ? Color.cyan.opacity(0.20) : Color.white.opacity(0.08)))
+                }
+                .buttonStyle(.plain)
+                .help("Toggle Under-Notch Terminal (⌥T) — sessions stay alive")
 
                 Button {
                     appState.isPinned = false

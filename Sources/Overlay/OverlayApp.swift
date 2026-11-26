@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var notchController: NotchWindowController!
     private var statusItem: NSStatusItem!
     private var hotKeyRef: EventHotKeyRef?
+    private var termHotKeyRef: EventHotKeyRef?
     private var hotKeyHandlerRef: EventHandlerRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -36,6 +37,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appState.virtualMicService.stopMix()
         appState.inputAudio.stopFXEngine()
         if let ref = hotKeyRef {
+            UnregisterEventHotKey(ref)
+        }
+        if let ref = termHotKeyRef {
             UnregisterEventHotKey(ref)
         }
     }
@@ -74,6 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Toggle NotchPulse (⌥Space)", action: #selector(toggleNotch), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Toggle Terminal Panel (⌥T)", action: #selector(toggleTerminal), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Pin / Unpin Notch", action: #selector(togglePin), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "PairPlay Audio Studio…", action: #selector(openPairPlayStudio), keyEquivalent: ""))
@@ -87,6 +92,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleNotch() {
         appState.toggleFromHotkey()
+    }
+
+    @objc private func toggleTerminal() {
+        TerminalWindowController.toggle(appState: appState)
     }
 
     @objc private func togglePin() {
@@ -129,11 +138,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         InstallEventHandler(
             GetApplicationEventTarget(),
-            { _, _, userData in
-                guard let userData else { return noErr }
+            { _, event, userData in
+                guard let userData, let event else { return noErr }
                 let delegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+                var hkID = EventHotKeyID()
+                GetEventParameter(
+                    event,
+                    EventParamName(kEventParamDirectObject),
+                    EventParamType(typeEventHotKeyID),
+                    nil,
+                    MemoryLayout<EventHotKeyID>.size,
+                    nil,
+                    &hkID
+                )
                 DispatchQueue.main.async {
-                    delegate.appState.toggleFromHotkey()
+                    if hkID.id == 2 {
+                        TerminalWindowController.toggle(appState: delegate.appState)
+                    } else {
+                        delegate.appState.toggleFromHotkey()
+                    }
                 }
                 return noErr
             },
@@ -146,5 +169,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hotKeyID = EventHotKeyID(signature: 0x4F564C59, id: 1) // 'OVLY'
         // kVK_Space = 49, optionKey = 2048
         RegisterEventHotKey(UInt32(kVK_Space), UInt32(optionKey), hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
+
+        let termHotKeyID = EventHotKeyID(signature: 0x4F564C59, id: 2)
+        // kVK_ANSI_T = 17, optionKey = 2048
+        RegisterEventHotKey(UInt32(kVK_ANSI_T), UInt32(optionKey), termHotKeyID, GetApplicationEventTarget(), 0, &termHotKeyRef)
     }
 }

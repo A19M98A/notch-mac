@@ -68,6 +68,7 @@ final class NotchWindowController: NSWindowController {
             .environmentObject(appState.networkMonitor)
             .environmentObject(appState.timerService)
             .environmentObject(appState.clipboardService)
+            .environmentObject(appState.terminalService)
 
         let hostingView = NSHostingView(rootView: rootView)
         hostingView.frame = NSRect(x: 0, y: 0, width: Self.windowWidth, height: Self.windowHeight)
