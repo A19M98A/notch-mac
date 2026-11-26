@@ -114,70 +114,6 @@ struct TerminalTheme: Identifiable, Equatable {
     }
 }
 
-// MARK: - Nerd Font / App Glyph Fallback Provider
-
-final class NerdFontFallbackProvider: TerminalGlyphFallbackProvider, @unchecked Sendable {
-    private let lock = NSLock()
-    private var fontFamily: String
-    private var cachedFonts: [CGFloat: CTFont] = [:]
-    private var gen: UInt64 = 1
-
-    init(fontFamily: String) {
-        self.fontFamily = fontFamily
-    }
-
-    var generation: UInt64 {
-        lock.lock()
-        defer { lock.unlock() }
-        return gen
-    }
-
-    func updateFontFamily(_ newFamily: String) {
-        lock.lock()
-        if fontFamily != newFamily {
-            fontFamily = newFamily
-            cachedFonts.removeAll()
-            gen &+= 1
-        }
-        lock.unlock()
-    }
-
-    func placementPolicy(for scalar: Unicode.Scalar) -> TerminalGlyphPlacementPolicy? {
-        let v = scalar.value
-        if (0xE0B0...0xE0D4).contains(v) {
-            return TerminalGlyphPlacementPolicy(placement: .stretch)
-        }
-        // Powerline, Devicons, FontAwesome, Octicons, Material Design Icons, Nerd Font PUA
-        if (0xE0A0...0xE0AF).contains(v) ||
-           (0xE200...0xE2A9).contains(v) ||
-           (0xE300...0xE3E3).contains(v) ||
-           (0xE5FA...0xE6B5).contains(v) ||
-           (0xE700...0xE7C5).contains(v) ||
-           (0xEA60...0xEC1E).contains(v) ||
-           (0xED00...0xEFCE).contains(v) ||
-           (0xF000...0xF2FF).contains(v) ||
-           (0xF300...0xF375).contains(v) ||
-           (0xF400...0xF533).contains(v) ||
-           (0xF0001...0xF1AF0).contains(v) {
-            return TerminalGlyphPlacementPolicy(placement: .icon)
-        }
-        return nil
-    }
-
-    func fallbackFont(forPointSize size: CGFloat) -> CTFont? {
-        lock.lock()
-        defer { lock.unlock() }
-        if let hit = cachedFonts[size] {
-            return hit
-        }
-        let nsFont = NSFont(name: fontFamily, size: size)
-            ?? NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
-        let ct = nsFont as CTFont
-        cachedFonts[size] = ct
-        return ct
-    }
-}
-
 // MARK: - Preferences
 
 struct TerminalPreferences: Codable, Equatable {
@@ -227,6 +163,7 @@ final class TerminalTabSession: NSObject, Identifiable, ObservableObject, LocalP
     let terminalView: LocalProcessTerminalView
     private weak var service: TerminalService?
 
+    @MainActor
     init(index: Int, service: TerminalService, startDirectory: String? = nil) {
         self.title = "zsh \(index)"
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -302,13 +239,6 @@ final class TerminalTabSession: NSObject, Identifiable, ObservableObject, LocalP
             self.title = "\(self.title) (exited)"
         }
     }
-
-    func processFailedToStart(source: TerminalView, error: LocalProcessError) {
-        DispatchQueue.main.async {
-            self.isRunning = false
-            self.title = "Failed to start shell"
-        }
-    }
 }
 
 // MARK: - Terminal Service (Session Manager + Fonts + Themes)
@@ -326,7 +256,6 @@ final class TerminalService: ObservableObject {
         return URL(fileURLWithPath: "\(dir)/terminal.json")
     }()
 
-    private var nerdFallbackProvider: NerdFontFallbackProvider
     private var tabCounter: Int = 0
 
     var activeTab: TerminalTabSession? {
@@ -343,10 +272,8 @@ final class TerminalService: ObservableObject {
     init() {
         let loaded = Self.loadPreferencesStatic()
         self.prefs = loaded
-        self.nerdFallbackProvider = NerdFontFallbackProvider(fontFamily: loaded.nerdFallbackFontName)
         self.availableMonospaceFonts = Self.discoverMonospaceFonts()
 
-        // Pick a great default font if SF Mono isn't preferred or Nerd Font is available
         if !availableMonospaceFonts.contains(prefs.fontName), let first = availableMonospaceFonts.first {
             prefs.fontName = first
         }
@@ -388,7 +315,6 @@ final class TerminalService: ObservableObject {
     @MainActor
     func updatePreferences(_ mutate: (inout TerminalPreferences) -> Void) {
         mutate(&prefs)
-        nerdFallbackProvider.updateFontFamily(prefs.nerdFallbackFontName)
         savePreferences()
         for tab in tabs {
             applyAppearance(to: tab)
@@ -403,7 +329,6 @@ final class TerminalService: ObservableObject {
         tv.nativeForegroundColor = theme.foreground
         tv.nativeBackgroundColor = theme.background.withAlphaComponent(CGFloat(prefs.opacity))
         tv.caretColor = theme.cursor
-        tv.glyphFallbackProvider = nerdFallbackProvider
         applyFont(to: tab)
     }
 
@@ -416,8 +341,17 @@ final class TerminalService: ObservableObject {
             chosenName = prefs.fontName
         }
         let size = CGFloat(prefs.fontSize)
-        let resolved = resolveFont(named: chosenName, size: size)
-        tab.terminalView.font = resolved
+        let baseFont = resolveFont(named: chosenName, size: size)
+        let fallbackName = prefs.nerdFallbackFontName
+        if !fallbackName.isEmpty && fallbackName != chosenName {
+            let fallbackDesc = NSFontDescriptor(fontAttributes: [.family: fallbackName])
+            let cascaded = baseFont.fontDescriptor.addingAttributes([.cascadeList: [fallbackDesc]])
+            if let finalFont = NSFont(descriptor: cascaded, size: size) {
+                tab.terminalView.font = finalFont
+                return
+            }
+        }
+        tab.terminalView.font = baseFont
     }
 
     private func resolveFont(named name: String, size: CGFloat) -> NSFont {
