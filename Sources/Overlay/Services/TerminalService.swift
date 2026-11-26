@@ -274,8 +274,15 @@ final class TerminalService: ObservableObject {
         self.prefs = loaded
         self.availableMonospaceFonts = Self.discoverMonospaceFonts()
 
-        if !availableMonospaceFonts.contains(prefs.fontName), let first = availableMonospaceFonts.first {
+        // Auto-select an installed Nerd Font for nvim / TUI apps & new installs so LazyVim icons render out of the box
+        let firstNerdFont = availableMonospaceFonts.first(where: { $0.lowercased().contains("nerd") })
+        if !FileManager.default.fileExists(atPath: prefsURL.path), let nerd = firstNerdFont {
+            prefs.fontName = nerd
+        } else if !availableMonospaceFonts.contains(prefs.fontName), let first = availableMonospaceFonts.first {
             prefs.fontName = first
+        }
+        if prefs.tuiAppFontName == "Same as Primary", let nerd = firstNerdFont {
+            prefs.tuiAppFontName = nerd
         }
     }
 
