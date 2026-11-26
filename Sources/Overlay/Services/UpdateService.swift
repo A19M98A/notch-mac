@@ -49,10 +49,13 @@ enum UpdateState: Equatable {
 /// in place, and automatically relaunches into the new version.
 final class UpdateService: NSObject, ObservableObject {
     static let repo = "A19M98A/notch-mac"
+    static let localSigningIdentity = "NotchPulse Dev"
 
     @Published var state: UpdateState = .idle
     @Published var lastChecked: Date? = nil
     @Published var channel: UpdateChannel = .stable
+    @Published var hasPersistentSigning: Bool = false
+    @Published var isBundleSignedPersistently: Bool = false
 
     var currentVersion: String {
         (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "1.1.0"
@@ -69,10 +72,138 @@ final class UpdateService: NSObject, ObservableObject {
 
     override init() {
         super.init()
+        refreshSigningStatus()
         // Quiet background check 5 seconds after launch
         DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
             self?.checkForUpdates(silentIfUpToDate: true)
         }
+    }
+
+    // MARK: - Persistent Local Code Signing (Preserves TCC Permissions Across Updates)
+
+    func refreshSigningStatus() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let hasCert = Self.checkKeychainHasIdentity(Self.localSigningIdentity)
+            let bundleSigned = Self.checkBundleSigned(by: Self.localSigningIdentity)
+            DispatchQueue.main.async {
+                self.hasPersistentSigning = hasCert
+                self.isBundleSignedPersistently = bundleSigned
+            }
+        }
+    }
+
+    private static func checkKeychainHasIdentity(_ identity: String) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        p.arguments = ["find-identity", "-v", "-p", "codesigning"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        let out = String(data: data, encoding: .utf8) ?? ""
+        return out.contains("\"\(identity)\"")
+    }
+
+    private static func checkBundleSigned(by identity: String) -> Bool {
+        let bundlePath = Bundle.main.bundlePath
+        guard bundlePath.hasSuffix(".app") else { return false }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        p.arguments = ["-dv", bundlePath]
+        let errPipe = Pipe()
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = errPipe
+        guard (try? p.run()) != nil else { return false }
+        let data = errPipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        let out = String(data: data, encoding: .utf8) ?? ""
+        return out.contains("Authority=\(identity)")
+    }
+
+    /// Creates & trusts a local self-signed Code Signing certificate (`NotchPulse Dev`) in the user's
+    /// login Keychain and signs the currently running `.app` with it, so all future updates keep macOS permissions.
+    func setupPersistentSigningAndResign(completion: @escaping (Bool, String) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let fm = FileManager.default
+            let workDir = fm.temporaryDirectory.appendingPathComponent("NotchPulseCert-\(UUID().uuidString)")
+
+            do {
+                if !Self.checkKeychainHasIdentity(Self.localSigningIdentity) {
+                    try fm.createDirectory(at: workDir, withIntermediateDirectories: true)
+                    let cnfURL = workDir.appendingPathComponent("cert.cnf")
+                    let keyURL = workDir.appendingPathComponent("key.pem")
+                    let crtURL = workDir.appendingPathComponent("cert.pem")
+                    let p12URL = workDir.appendingPathComponent("cert.p12")
+
+                    let cnf = """
+                    [req]
+                    distinguished_name = req_distinguished_name
+                    x509_extensions = v3_codesign
+                    prompt = no
+
+                    [req_distinguished_name]
+                    CN = \(Self.localSigningIdentity)
+                    O = NotchPulse
+
+                    [v3_codesign]
+                    basicConstraints = critical, CA:false
+                    keyUsage = critical, digitalSignature
+                    extendedKeyUsage = critical, codeSigning
+                    """
+                    try cnf.write(to: cnfURL, atomically: true, encoding: .utf8)
+
+                    guard Self.runSimple("/usr/bin/openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", keyURL.path, "-out", crtURL.path, "-days", "3650", "-config", cnfURL.path]) == 0 else {
+                        throw NSError(domain: "NotchPulse", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to generate signing key."])
+                    }
+                    guard Self.runSimple("/usr/bin/openssl", ["pkcs12", "-export", "-out", p12URL.path, "-inkey", keyURL.path, "-in", crtURL.path, "-passout", "pass:notchpulse"]) == 0 else {
+                        throw NSError(domain: "NotchPulse", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to package PKCS12 certificate."])
+                    }
+
+                    let loginKC = "\(fm.homeDirectoryForCurrentUser.path)/Library/Keychains/login.keychain-db"
+                    guard Self.runSimple("/usr/bin/security", ["import", p12URL.path, "-k", loginKC, "-P", "notchpulse", "-T", "/usr/bin/codesign"]) == 0 else {
+                        throw NSError(domain: "NotchPulse", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to import certificate into login Keychain."])
+                    }
+
+                    // Trust certificate for Code Signing
+                    _ = Self.runSimple("/usr/bin/security", ["add-trusted-cert", "-d", "-r", "trustRoot", "-p", "codeSign", "-k", loginKC, crtURL.path])
+                    try? fm.removeItem(at: workDir)
+                }
+
+                // Sign the running .app bundle in place if it's an .app
+                let bundlePath = Bundle.main.bundlePath
+                if bundlePath.hasSuffix(".app") {
+                    guard Self.runSimple("/usr/bin/codesign", ["--force", "--deep", "--sign", Self.localSigningIdentity, bundlePath]) == 0 else {
+                        throw NSError(domain: "NotchPulse", code: 4, userInfo: [NSLocalizedDescriptionKey: "Created cert, but codesign failed on \(bundlePath)."])
+                    }
+                }
+
+                self.refreshSigningStatus()
+                DispatchQueue.main.async {
+                    completion(true, "Persistent signing ready! Future updates will keep Accessibility & Audio permissions.")
+                }
+            } catch {
+                try? fm.removeItem(at: workDir)
+                self.refreshSigningStatus()
+                DispatchQueue.main.async {
+                    completion(false, error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private static func runSimple(_ exe: String, _ args: [String]) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: exe)
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return -1 }
+        p.waitUntilExit()
+        return p.terminationStatus
     }
 
     func checkForUpdates(silentIfUpToDate: Bool = false) {
@@ -283,6 +414,13 @@ final class UpdateService: NSObject, ObservableObject {
             ? currentBundlePath
             : "/Applications/NotchPulse.app"
 
+        // If user has persistent local signing identity ('NotchPulse Dev'), automatically re-sign the updated app
+        // so macOS preserves Accessibility, System Audio, Microphone, and Full Disk Access permissions!
+        let usePersistentSign = Self.checkKeychainHasIdentity(Self.localSigningIdentity)
+        let signStep = usePersistentSign
+            ? "/usr/bin/codesign --force --deep --sign \"\(Self.localSigningIdentity)\" \"$DST\" 2>/dev/null || true"
+            : "# ad-hoc signature kept"
+
         let currentPID = ProcessInfo.processInfo.processIdentifier
         let scriptPath = workDir.appendingPathComponent("apply_update.sh").path
         let script = """
@@ -312,6 +450,7 @@ final class UpdateService: NSObject, ObservableObject {
             exit 1
         fi
 
+        \(signStep)
         rm -rf "$WORK"
         open -n "$DST"
         """

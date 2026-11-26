@@ -75,6 +75,118 @@ final class VPNService: ObservableObject {
         fm.isExecutableFile(atPath: helperPath)
     }
 
+    func installPasswordlessHelper(completion: @escaping (Bool, String) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+
+            let bundledPath = Bundle.main.path(forResource: "overlay_vpn_core", ofType: "sh")
+            let tmpHelper = "/tmp/notchpulse-overlay-vpn-core-\(UUID().uuidString).sh"
+            let srcPath: String
+
+            if let bPath = bundledPath, self.fm.fileExists(atPath: bPath) {
+                srcPath = bPath
+            } else {
+                // Fallback: write embedded script to /tmp
+                do {
+                    try Self.embeddedVPNCoreScript.write(toFile: tmpHelper, atomically: true, encoding: .utf8)
+                    srcPath = tmpHelper
+                } catch {
+                    DispatchQueue.main.async {
+                        completion(false, "Could not prepare helper script: \(error.localizedDescription)")
+                    }
+                    return
+                }
+            }
+
+            let userName = NSUserName()
+            func q(_ s: String) -> String { "'\(s.replacingOccurrences(of: "'", with: "'\\''"))'" }
+
+            let shellCmd = """
+            mkdir -p /usr/local/libexec && \
+            cp \(q(srcPath)) \(q(self.helperPath)) && \
+            chown root:wheel \(q(self.helperPath)) && \
+            chmod 755 \(q(self.helperPath)) && \
+            TMP_SUD=$(mktemp) && \
+            printf '%s ALL=(root) NOPASSWD: %s *\\n' \(q(userName)) \(q(self.helperPath)) > "$TMP_SUD" && \
+            visudo -cf "$TMP_SUD" && \
+            cp "$TMP_SUD" /etc/sudoers.d/overlay-vpn && \
+            chown root:wheel /etc/sudoers.d/overlay-vpn && \
+            chmod 440 /etc/sudoers.d/overlay-vpn && \
+            rm -f "$TMP_SUD"
+            """
+            let escaped = shellCmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            let appleScript = "do shell script \"\(escaped)\" with administrator privileges"
+            let (rc, out) = self.runProcessWithStatus(executable: "/usr/bin/osascript", arguments: ["-e", appleScript])
+            try? self.fm.removeItem(atPath: tmpHelper)
+
+            DispatchQueue.main.async {
+                self.objectWillChange.send()
+                if rc == 0 {
+                    self.setFeedback("Passwordless VPN helper installed", isError: false)
+                    completion(true, "Installed! VPN connect/disconnect now runs without password prompts.")
+                } else {
+                    let msg = out.trimmingCharacters(in: .whitespacesAndNewlines)
+                    completion(false, msg.isEmpty ? "Installation cancelled or failed." : msg)
+                }
+            }
+        }
+    }
+
+    private static let embeddedVPNCoreScript = #"""
+#!/usr/bin/env bash
+set -euo pipefail
+CMD="${1:-}"
+shift || true
+case "$CMD" in
+    start-singbox)
+        BIN="$1"; CFG="$2"; PID_FILE="$3"; LOG_FILE="$4"
+        if [ -f "$PID_FILE" ]; then
+            OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+            [ -n "$OLD_PID" ] && kill -TERM "$OLD_PID" 2>/dev/null || true
+            rm -f "$PID_FILE"
+        fi
+        "$BIN" check -c "$CFG"
+        nohup "$BIN" run -c "$CFG" >> "$LOG_FILE" 2>&1 < /dev/null &
+        echo $! > "$PID_FILE"
+        ;;
+    start-openconnect)
+        BIN="$1"; PID_FILE="$2"; SERVER="$3"; USER_NAME="${4:-}"; PASSWORD="${5:-}"; EXTRA_ARGS="${6:-}"; LOG_FILE="${7:-/tmp/overlay-openconnect.log}"
+        if [ -f "$PID_FILE" ]; then
+            OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+            [ -n "$OLD_PID" ] && (kill -INT "$OLD_PID" 2>/dev/null || kill -TERM "$OLD_PID" 2>/dev/null || true)
+            rm -f "$PID_FILE"
+        fi
+        ARGS=("--background" "--non-inter" "--pid-file=$PID_FILE")
+        [ -n "$USER_NAME" ] && ARGS+=("--user" "$USER_NAME")
+        if [ -n "$EXTRA_ARGS" ]; then
+            EXTRA_ARR=($EXTRA_ARGS)
+            ARGS+=("${EXTRA_ARR[@]}")
+        fi
+        if [ -n "$PASSWORD" ]; then
+            ARGS+=("--passwd-on-stdin")
+            printf '%s\n' "$PASSWORD" | "$BIN" "${ARGS[@]}" "$SERVER" >> "$LOG_FILE" 2>&1 < /dev/null
+        else
+            "$BIN" "${ARGS[@]}" "$SERVER" >> "$LOG_FILE" 2>&1 < /dev/null
+        fi
+        ;;
+    stop-pid)
+        PID="$1"; PID_FILE="${2:-}"
+        kill -INT "$PID" 2>/dev/null || kill -TERM "$PID" 2>/dev/null || true
+        [ -n "$PID_FILE" ] && rm -f "$PID_FILE"
+        ;;
+    stop-all)
+        SB_PID="${1:-}"; OC_PID="${2:-}"
+        pkill -TERM -f "sing-box run" 2>/dev/null || true
+        pkill -INT openconnect 2>/dev/null || pkill -TERM openconnect 2>/dev/null || true
+        [ -n "$SB_PID" ] && rm -f "$SB_PID"
+        [ -n "$OC_PID" ] && rm -f "$OC_PID"
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+"""#
+
     init() {
         ensureConfigDir()
         loadStore()
@@ -635,10 +747,11 @@ final class VPNService: ObservableObject {
                 setFeedback("openconnect not installed (brew install openconnect)", isError: true)
                 return
             }
+            ensureConfigDir()
             saveActiveSession(server: server, providerKind: "openconnect")
             runPrivilegedCoreAction(
                 command: "start-openconnect",
-                args: [ocBin, openConnectPIDFile, server.address, server.username, server.secret, server.extraArgs],
+                args: [ocBin, openConnectPIDFile, server.address, server.username, server.secret, server.extraArgs, "\(configDir)/openconnect.log"],
                 successMessage: "Connected to \(server.displayName)"
             )
 
@@ -765,16 +878,17 @@ final class VPNService: ObservableObject {
             return "if [ -f \(q(pidF)) ]; then kill $(cat \(q(pidF))) 2>/dev/null || true; rm -f \(q(pidF)); fi; \(q(bin)) check -c \(q(cfg)) && nohup \(q(bin)) run -c \(q(cfg)) >> \(q(logF)) 2>&1 < /dev/null & echo $! > \(q(pidF))"
         case "start-openconnect":
             let bin = args[0], pidF = args[1], srv = args[2], usr = args[3], pw = args[4], extra = args[5]
+            let logF = args.count > 6 ? args[6] : "/tmp/overlay-openconnect.log"
             let userArg = usr.isEmpty ? "" : "--user \(q(usr))"
             let pwPipe = pw.isEmpty ? "" : "printf '%s\\n' \(q(pw)) | "
             let pwFlag = pw.isEmpty ? "" : "--passwd-on-stdin"
-            return "\(pwPipe)\(q(bin)) --background --non-inter --pid-file=\(q(pidF)) \(userArg) \(pwFlag) \(extra) \(q(srv))"
+            return "if [ -f \(q(pidF)) ]; then kill -INT $(cat \(q(pidF))) 2>/dev/null || kill -TERM $(cat \(q(pidF))) 2>/dev/null || true; rm -f \(q(pidF)); fi; \(pwPipe)\(q(bin)) --background --non-inter --pid-file=\(q(pidF)) \(userArg) \(pwFlag) \(extra) \(q(srv)) >> \(q(logF)) 2>&1 < /dev/null"
         case "stop-pid":
             let pid = args[0], pidF = args[1]
-            return "kill -TERM \(q(pid)) 2>/dev/null || true; rm -f \(q(pidF))"
+            return "kill -INT \(q(pid)) 2>/dev/null || kill -TERM \(q(pid)) 2>/dev/null || true; rm -f \(q(pidF))"
         case "stop-all":
             let sbPid = args[0], ocPid = args[1]
-            return "pkill -TERM -f 'sing-box run' 2>/dev/null || true; pkill -TERM openconnect 2>/dev/null || true; rm -f \(q(sbPid)) \(q(ocPid))"
+            return "pkill -TERM -f 'sing-box run' 2>/dev/null || true; pkill -INT openconnect 2>/dev/null || pkill -TERM openconnect 2>/dev/null || true; rm -f \(q(sbPid)) \(q(ocPid))"
         default:
             return "true"
         }

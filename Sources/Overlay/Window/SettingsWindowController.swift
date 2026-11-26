@@ -87,6 +87,8 @@ struct NotchSettingsView: View {
     @State private var axTrusted: Bool = AXIsProcessTrusted()
     @State private var micGranted: Bool = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
     @State private var copiedHint: String? = nil
+    @State private var isSettingUpSigning: Bool = false
+    @State private var isInstallingHelper: Bool = false
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: 22, style: .continuous)
@@ -434,6 +436,8 @@ struct NotchSettingsView: View {
                     .buttonStyle(.plain)
                 }
 
+                persistentSigningPermissionRow
+
                 permissionRow(
                     title: "Notification DB (Zero-Flash Mode)",
                     detail: appState.notificationService.canReadNotificationDB ? "Reading macOS NotificationCenter DB directly" : "Grant Full Disk Access to read notifications with DND/Banners Off",
@@ -443,14 +447,7 @@ struct NotchSettingsView: View {
                     appState.notificationService.openFullDiskAccessSettings()
                 }
 
-                permissionRow(
-                    title: "Accessibility",
-                    detail: "Control background media players & hotkeys",
-                    ok: axTrusted,
-                    actionTitle: axTrusted ? "Granted" : "Open Settings"
-                ) {
-                    mediaService.requestAccessibilityPermission()
-                }
+                accessibilityPermissionRow
 
                 permissionRow(
                     title: "Microphone",
@@ -494,16 +491,7 @@ struct NotchSettingsView: View {
                     flashHint("Copied brew install sing-box")
                 }
 
-                permissionRow(
-                    title: "Passwordless VPN Helper",
-                    detail: vpnService.isPasswordlessHelperInstalled ? "Installed at /usr/local/libexec/overlay-vpn-core.sh" : "Avoids sudo prompt on VPN connect/disconnect",
-                    ok: vpnService.isPasswordlessHelperInstalled,
-                    actionTitle: vpnService.isPasswordlessHelperInstalled ? "Installed" : "Copy Cmd"
-                ) {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString("scripts/install_vpn_helper.sh", forType: .string)
-                    flashHint("Copied helper command")
-                }
+                vpnHelperPermissionRow
             }
             .padding(.horizontal, 18)
         }
@@ -835,10 +823,122 @@ struct NotchSettingsView: View {
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.05)))
     }
 
+    private var persistentSigningPermissionRow: some View {
+        let ok = updateService.isBundleSignedPersistently
+        let hasCert = updateService.hasPersistentSigning
+        let detail = ok
+            ? "Signed with 'NotchPulse Dev' — permissions survive all updates"
+            : (hasCert ? "Cert ready — click Re-sign so this build keeps permissions" : "Sign with a local Keychain cert so updates never reset permissions")
+        let btnTitle = isSettingUpSigning ? "Signing…" : (ok ? "Active" : (hasCert ? "Re-sign" : "Enable"))
+
+        return permissionRow(
+            title: "Keep Permissions Across Updates",
+            detail: detail,
+            ok: ok,
+            actionTitle: btnTitle
+        ) {
+            guard !isSettingUpSigning else { return }
+            isSettingUpSigning = true
+            updateService.setupPersistentSigningAndResign { success, msg in
+                isSettingUpSigning = false
+                flashHint(success ? "Persistent signing active!" : msg)
+                refreshPermissions()
+            }
+        }
+    }
+
+    private var accessibilityPermissionRow: some View {
+        let iconColor: Color = axTrusted ? .green : .orange
+        let detail = axTrusted
+            ? "Control background media players, hotkeys & Notch-Only alerts"
+            : "If already checked in Settings, click Reset & Fix to clear stale build entry"
+
+        return HStack(spacing: 10) {
+            Image(systemName: axTrusted ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                .font(.system(size: 15))
+                .foregroundColor(iconColor)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Accessibility")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.white)
+                Text(detail)
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.white.opacity(0.5))
+                    .lineLimit(1)
+            }
+            Spacer()
+            if !axTrusted {
+                Button("Reset & Fix") {
+                    resetStaleAccessibility()
+                }
+                .font(.system(size: 10, weight: .bold))
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(Color.orange.opacity(0.24)))
+                .foregroundColor(.orange)
+                .buttonStyle(.plain)
+            }
+            Button(axTrusted ? "Granted" : "Open Settings") {
+                mediaService.requestAccessibilityPermission()
+            }
+            .font(.system(size: 10, weight: .bold))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Capsule().fill(axTrusted ? Color.green.opacity(0.18) : Color.white.opacity(0.14)))
+            .foregroundColor(axTrusted ? .green : .white)
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.05)))
+    }
+
+    private var vpnHelperPermissionRow: some View {
+        let installed = vpnService.isPasswordlessHelperInstalled
+        let detail = installed
+            ? "Installed at /usr/local/libexec/overlay-vpn-core.sh"
+            : "Avoids password prompt on VPN connect/disconnect"
+        let btnTitle = isInstallingHelper ? "Installing…" : (installed ? "Update" : "Install")
+
+        return permissionRow(
+            title: "Passwordless VPN Helper",
+            detail: detail,
+            ok: installed,
+            actionTitle: btnTitle
+        ) {
+            guard !isInstallingHelper else { return }
+            isInstallingHelper = true
+            vpnService.installPasswordlessHelper { success, msg in
+                isInstallingHelper = false
+                flashHint(success ? "VPN helper installed!" : msg)
+                refreshPermissions()
+            }
+        }
+    }
+
+    private func resetStaleAccessibility() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+            proc.arguments = ["reset", "Accessibility", "com.amin.NotchPulse"]
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+            try? proc.run()
+            proc.waitUntilExit()
+
+            DispatchQueue.main.async {
+                mediaService.requestAccessibilityPermission()
+                flashHint("Cleared stale entry — toggle ON in Settings")
+                refreshPermissions()
+            }
+        }
+    }
+
     private func refreshPermissions() {
         axTrusted = AXIsProcessTrusted()
         micGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
         appState.notificationService.checkDatabaseAccess()
+        updateService.refreshSigningStatus()
         inputAudio.refreshAll()
         vpnService.refresh()
     }

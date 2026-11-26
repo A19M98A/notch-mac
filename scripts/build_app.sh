@@ -39,6 +39,11 @@ if [ -f "$ROOT_DIR/Resources/AppIcon.icns" ]; then
     cp "$ROOT_DIR/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 fi
 
+if [ -f "$ROOT_DIR/scripts/overlay_vpn_core.sh" ]; then
+    cp "$ROOT_DIR/scripts/overlay_vpn_core.sh" "$APP_BUNDLE/Contents/Resources/overlay_vpn_core.sh"
+    chmod +x "$APP_BUNDLE/Contents/Resources/overlay_vpn_core.sh"
+fi
+
 cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

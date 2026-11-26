@@ -30,6 +30,14 @@ case "$CMD" in
         USER_NAME="${4:-}"
         PASSWORD="${5:-}"
         EXTRA_ARGS="${6:-}"
+        LOG_FILE="${7:-/tmp/overlay-openconnect.log}"
+        if [ -f "$PID_FILE" ]; then
+            OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+            if [ -n "$OLD_PID" ]; then
+                kill -INT "$OLD_PID" 2>/dev/null || kill -TERM "$OLD_PID" 2>/dev/null || true
+            fi
+            rm -f "$PID_FILE"
+        fi
         ARGS=("--background" "--non-inter" "--pid-file=$PID_FILE")
         if [ -n "$USER_NAME" ]; then
             ARGS+=("--user" "$USER_NAME")
@@ -41,15 +49,15 @@ case "$CMD" in
         fi
         if [ -n "$PASSWORD" ]; then
             ARGS+=("--passwd-on-stdin")
-            printf '%s\n' "$PASSWORD" | "$BIN" "${ARGS[@]}" "$SERVER"
+            printf '%s\n' "$PASSWORD" | "$BIN" "${ARGS[@]}" "$SERVER" >> "$LOG_FILE" 2>&1 < /dev/null
         else
-            "$BIN" "${ARGS[@]}" "$SERVER"
+            "$BIN" "${ARGS[@]}" "$SERVER" >> "$LOG_FILE" 2>&1 < /dev/null
         fi
         ;;
     stop-pid)
         PID="$1"
         PID_FILE="${2:-}"
-        kill -TERM "$PID" 2>/dev/null || true
+        kill -INT "$PID" 2>/dev/null || kill -TERM "$PID" 2>/dev/null || true
         if [ -n "$PID_FILE" ]; then
             rm -f "$PID_FILE"
         fi
@@ -58,7 +66,7 @@ case "$CMD" in
         SB_PID="${1:-}"
         OC_PID="${2:-}"
         pkill -TERM -f "sing-box run" 2>/dev/null || true
-        pkill -TERM openconnect 2>/dev/null || true
+        pkill -INT openconnect 2>/dev/null || pkill -TERM openconnect 2>/dev/null || true
         [ -n "$SB_PID" ] && rm -f "$SB_PID"
         [ -n "$OC_PID" ] && rm -f "$OC_PID"
         ;;
