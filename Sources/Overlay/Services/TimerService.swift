@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import AVFoundation
 import Combine
 
 struct TimerPreset: Identifiable {
@@ -27,6 +28,7 @@ final class TimerService: ObservableObject {
 
     private var timer: Timer?
     private var chimeTimer: Timer?
+    private var alarmPlayer: AVAudioPlayer?
 
     var progress: Double {
         guard totalSeconds > 0 else { return 0 }
@@ -105,6 +107,7 @@ final class TimerService: ObservableObject {
         finishedFlash = false
         chimeTimer?.invalidate()
         chimeTimer = nil
+        alarmPlayer?.stop()
     }
 
     func snooze(minutes: Int = 5) {
@@ -134,11 +137,55 @@ final class TimerService: ObservableObject {
     }
 
     private func playNiceChime() {
-        // Layered gentle macOS chime (Glass followed closely by Hero/Ping shimmer)
-        NSSound(named: "Glass")?.play()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.32) { [weak self] in
-            guard self?.isAlarmRinging == true else { return }
-            NSSound(named: "Hero")?.play()
+        if alarmPlayer == nil {
+            alarmPlayer = Self.buildTimerChimePlayer()
         }
+        alarmPlayer?.currentTime = 0
+        alarmPlayer?.volume = 0.65
+        alarmPlayer?.play()
+    }
+
+    private static func buildTimerChimePlayer() -> AVAudioPlayer? {
+        let sampleRate = 48000
+        let durationSec = 1.25
+        let frameCount = Int(Double(sampleRate) * durationSec)
+        var pcm = [Int16](repeating: 0, count: frameCount * 2)
+
+        let notes: [(offset: Double, freq: Double)] = [
+            (0.00, 523.25), // C5
+            (0.14, 659.25), // E5
+            (0.28, 783.99), // G5
+            (0.42, 1046.50) // C6
+        ]
+
+        for i in 0..<frameCount {
+            let t = Double(i) / Double(sampleRate)
+            var mix = 0.0
+            for note in notes {
+                let dt = t - note.offset
+                if dt > 0 {
+                    let env = min(1.0, dt / 0.018) * exp(-dt * 4.5)
+                    mix += (sin(2.0 * .pi * note.freq * dt) + 0.25 * sin(2.0 * .pi * (note.freq * 2.0) * dt)) * env
+                }
+            }
+            let val = max(-1.0, min(1.0, mix * 0.25))
+            let s16 = Int16(val * Double(Int16.max))
+            pcm[i * 2] = s16
+            pcm[i * 2 + 1] = s16
+        }
+
+        let dataBytes = pcm.count * 2
+        var wav = Data()
+        func u32(_ v: UInt32) { var le = v.littleEndian; wav.append(Data(bytes: &le, count: 4)) }
+        func u16(_ v: UInt16) { var le = v.littleEndian; wav.append(Data(bytes: &le, count: 2)) }
+        wav.append("RIFF".data(using: .ascii)!); u32(UInt32(36 + dataBytes))
+        wav.append("WAVEfmt ".data(using: .ascii)!); u32(16); u16(1); u16(2)
+        u32(UInt32(sampleRate)); u32(UInt32(sampleRate * 4)); u16(4); u16(16)
+        wav.append("data".data(using: .ascii)!); u32(UInt32(dataBytes))
+        pcm.withUnsafeBytes { wav.append(contentsOf: $0) }
+
+        let player = try? AVAudioPlayer(data: wav)
+        player?.prepareToPlay()
+        return player
     }
 }

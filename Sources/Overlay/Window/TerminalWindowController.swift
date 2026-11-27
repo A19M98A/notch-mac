@@ -13,6 +13,10 @@ final class TerminalWindowController: NSWindowController {
     let terminalService: TerminalService
     private let appState: AppState
     private var cancellables = Set<AnyCancellable>()
+    private var dragStartMouse: NSPoint? = nil
+    private var dragStartOrigin: NSPoint? = nil
+    private var resizeStartMouse: NSPoint? = nil
+    private var resizeStartFrame: NSRect? = nil
 
     static func toggle(appState: AppState) {
         if let existing = shared, existing.window?.isVisible == true {
@@ -76,8 +80,10 @@ final class TerminalWindowController: NSWindowController {
             terminalService: appState.terminalService,
             onSnapToNotch: { [weak self] in self?.snapToNotch() },
             onHide: { [weak self] in self?.hidePanel() },
-            onDragMove: { [weak self] delta in self?.moveBy(delta: delta) },
-            onResizeDelta: { [weak self] dw, dh in self?.resizeBy(dw: dw, dh: dh) },
+            onDragChanged: { [weak self] in self?.handleScreenDragChanged() },
+            onDragEnded: { [weak self] in self?.handleScreenDragEnded() },
+            onResizeChanged: { [weak self] in self?.handleScreenResizeChanged() },
+            onResizeEnded: { [weak self] in self?.handleScreenResizeEnded() },
             onBehaviorChanged: { [weak self] in self?.applyWindowBehavior() },
             onSizePreset: { [weak self] w, h in self?.setSize(width: w, height: h) }
         )
@@ -168,33 +174,60 @@ final class TerminalWindowController: NSWindowController {
         window.setFrame(rect, display: true, animate: animated)
     }
 
-    private func moveBy(delta: CGSize) {
+    private func handleScreenDragChanged() {
         guard let window else { return }
-        var frame = window.frame
-        frame.origin.x += delta.width
-        frame.origin.y -= delta.height
-        window.setFrameOrigin(frame.origin)
+        let mouse = NSEvent.mouseLocation
+        if dragStartMouse == nil || dragStartOrigin == nil {
+            dragStartMouse = mouse
+            dragStartOrigin = window.frame.origin
+            return
+        }
+        guard let startMouse = dragStartMouse, let startOrigin = dragStartOrigin else { return }
+        let newOrigin = NSPoint(
+            x: startOrigin.x + (mouse.x - startMouse.x),
+            y: startOrigin.y + (mouse.y - startMouse.y)
+        )
+        window.setFrameOrigin(newOrigin)
         terminalService.prefs.isDockedUnderNotch = false
-        terminalService.prefs.customX = Double(frame.origin.x)
-        terminalService.prefs.customY = Double(frame.origin.y)
+        terminalService.prefs.customX = Double(newOrigin.x)
+        terminalService.prefs.customY = Double(newOrigin.y)
     }
 
-    private func resizeBy(dw: CGFloat, dh: CGFloat) {
+    private func handleScreenDragEnded() {
+        dragStartMouse = nil
+        dragStartOrigin = nil
+        terminalService.updatePreferences { _ in }
+    }
+
+    private func handleScreenResizeChanged() {
         guard let window else { return }
-        let newW = max(460, min(1200, window.frame.width + dw))
-        let newH = max(220, min(720, window.frame.height + dh))
-        var frame = window.frame
-        // Keep top edge anchored when resizing height (or centered when docked under notch)
-        let oldMaxY = frame.maxY
-        let oldMidX = frame.midX
+        let mouse = NSEvent.mouseLocation
+        if resizeStartMouse == nil || resizeStartFrame == nil {
+            resizeStartMouse = mouse
+            resizeStartFrame = window.frame
+            return
+        }
+        guard let startMouse = resizeStartMouse, let startFrame = resizeStartFrame else { return }
+        let dw = mouse.x - startMouse.x
+        let dh = startMouse.y - mouse.y // Screen Y increases upward; dragging down decreases mouse.y -> increases height
+
+        let newW = max(460, min(1200, startFrame.width + dw))
+        let newH = max(220, min(720, startFrame.height + dh))
+        var frame = startFrame
         frame.size = NSSize(width: newW, height: newH)
-        frame.origin.y = oldMaxY - newH
+        frame.origin.y = startFrame.maxY - newH
         if terminalService.prefs.isDockedUnderNotch {
-            frame.origin.x = oldMidX - newW / 2
+            frame.origin.x = startFrame.midX - newW / 2
         }
         window.setFrame(frame, display: true, animate: false)
         terminalService.prefs.panelWidth = Double(newW)
         terminalService.prefs.panelHeight = Double(newH)
+    }
+
+    private func handleScreenResizeEnded() {
+        resizeStartMouse = nil
+        resizeStartFrame = nil
+        terminalService.updatePreferences { _ in }
     }
 }
 
@@ -241,14 +274,14 @@ private struct TerminalPanelRootView: View {
 
     let onSnapToNotch: () -> Void
     let onHide: () -> Void
-    let onDragMove: (CGSize) -> Void
-    let onResizeDelta: (CGFloat, CGFloat) -> Void
+    let onDragChanged: () -> Void
+    let onDragEnded: () -> Void
+    let onResizeChanged: () -> Void
+    let onResizeEnded: () -> Void
     let onBehaviorChanged: () -> Void
     let onSizePreset: (Double, Double) -> Void
 
     @State private var showOptions: Bool = false
-    @State private var lastDragTranslation: CGSize = .zero
-    @State private var lastResizeTranslation: CGSize = .zero
 
     var body: some View {
         let theme = terminalService.currentTheme
@@ -395,15 +428,11 @@ private struct TerminalPanelRootView: View {
         .contentShape(Rectangle())
         .gesture(
             DragGesture(minimumDistance: 2)
-                .onChanged { val in
-                    let dx = val.translation.width - lastDragTranslation.width
-                    let dy = val.translation.height - lastDragTranslation.height
-                    lastDragTranslation = val.translation
-                    onDragMove(CGSize(width: dx, height: dy))
+                .onChanged { _ in
+                    onDragChanged()
                 }
                 .onEnded { _ in
-                    lastDragTranslation = .zero
-                    terminalService.updatePreferences { _ in }
+                    onDragEnded()
                 }
         )
     }
@@ -481,15 +510,11 @@ private struct TerminalPanelRootView: View {
             .contentShape(Rectangle())
             .gesture(
                 DragGesture(minimumDistance: 1)
-                    .onChanged { val in
-                        let dw = val.translation.width - lastResizeTranslation.width
-                        let dh = val.translation.height - lastResizeTranslation.height
-                        lastResizeTranslation = val.translation
-                        onResizeDelta(dw, dh)
+                    .onChanged { _ in
+                        onResizeChanged()
                     }
                     .onEnded { _ in
-                        lastResizeTranslation = .zero
-                        terminalService.updatePreferences { _ in }
+                        onResizeEnded()
                     }
             )
     }

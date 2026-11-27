@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import ApplicationServices
+import AVFoundation
 import SQLite3
 import Combine
 
@@ -64,6 +65,7 @@ final class NotificationService: ObservableObject {
     private var walWatcher: DispatchSourceFileSystemObject?
     private var dbWatcher: DispatchSourceFileSystemObject?
     private var watchedDBPath: String?
+    private var alertSoundPlayer: AVAudioPlayer?
 
     init() {
         checkDatabaseAccess()
@@ -274,9 +276,8 @@ final class NotificationService: ObservableObject {
             }
 
             guard self.enabled else { return }
-            if playSubtleSound, let sound = NSSound(named: NSSound.Name("Glass")) ?? NSSound(named: NSSound.Name("Tink")) {
-                sound.volume = 0.45
-                sound.play()
+            if playSubtleSound {
+                self.playCleanAlertChime()
             }
             self.isReplying = false
             self.replyText = ""
@@ -1030,5 +1031,56 @@ final class NotificationService: ObservableObject {
 
     private func findAppIcon(named name: String) -> NSImage? {
         matchApp(name: name)?.icon
+    }
+
+    private func playCleanAlertChime() {
+        if alertSoundPlayer == nil {
+            alertSoundPlayer = Self.buildSoftChimePlayer()
+        }
+        alertSoundPlayer?.currentTime = 0
+        alertSoundPlayer?.volume = 0.55
+        alertSoundPlayer?.play()
+    }
+
+    /// Synthesizes a smooth 2-note glass chime (C6 -> G6) with soft 15ms fade-in to avoid CoreAudio click/noise.
+    private static func buildSoftChimePlayer() -> AVAudioPlayer? {
+        let sampleRate = 48000
+        let durationSec = 0.55
+        let frameCount = Int(Double(sampleRate) * durationSec)
+        var pcm = [Int16](repeating: 0, count: frameCount * 2)
+
+        for i in 0..<frameCount {
+            let t = Double(i) / Double(sampleRate)
+            // Note 1: C6 (1046.5 Hz) at t=0
+            let a1 = min(1.0, t / 0.015) * exp(-t * 9.0)
+            let w1 = (sin(2.0 * .pi * 1046.5 * t) + 0.25 * sin(2.0 * .pi * 2093.0 * t)) * a1
+
+            // Note 2: G6 (1567.98 Hz) at t=0.11s
+            let t2 = t - 0.11
+            var w2 = 0.0
+            if t2 > 0 {
+                let a2 = min(1.0, t2 / 0.015) * exp(-t2 * 8.0)
+                w2 = (sin(2.0 * .pi * 1567.98 * t2) + 0.22 * sin(2.0 * .pi * 3135.96 * t2)) * a2
+            }
+
+            let val = max(-1.0, min(1.0, (w1 + w2) * 0.35))
+            let s16 = Int16(val * Double(Int16.max))
+            pcm[i * 2] = s16
+            pcm[i * 2 + 1] = s16
+        }
+
+        let dataBytes = pcm.count * 2
+        var wav = Data()
+        func u32(_ v: UInt32) { var le = v.littleEndian; wav.append(Data(bytes: &le, count: 4)) }
+        func u16(_ v: UInt16) { var le = v.littleEndian; wav.append(Data(bytes: &le, count: 2)) }
+        wav.append("RIFF".data(using: .ascii)!); u32(UInt32(36 + dataBytes))
+        wav.append("WAVEfmt ".data(using: .ascii)!); u32(16); u16(1); u16(2)
+        u32(UInt32(sampleRate)); u32(UInt32(sampleRate * 4)); u16(4); u16(16)
+        wav.append("data".data(using: .ascii)!); u32(UInt32(dataBytes))
+        pcm.withUnsafeBytes { wav.append(contentsOf: $0) }
+
+        let player = try? AVAudioPlayer(data: wav)
+        player?.prepareToPlay()
+        return player
     }
 }
