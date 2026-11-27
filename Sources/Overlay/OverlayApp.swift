@@ -18,9 +18,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var appState: AppState!
     private var notchController: NotchWindowController!
     private var statusItem: NSStatusItem!
-    private var hotKeyRef: EventHotKeyRef?
-    private var termHotKeyRef: EventHotKeyRef?
-    private var hotKeyHandlerRef: EventHandlerRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         appState = AppState()
@@ -36,12 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appState.perAppMixer.teardownAllTaps()
         appState.virtualMicService.stopMix()
         appState.inputAudio.stopFXEngine()
-        if let ref = hotKeyRef {
-            UnregisterEventHotKey(ref)
-        }
-        if let ref = termHotKeyRef {
-            UnregisterEventHotKey(ref)
-        }
+        ShortcutService.shared.stop()
     }
 
     private func setupMainMenu() {
@@ -130,48 +122,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.terminate(nil)
     }
 
-    // MARK: - Global Hotkey (Option + Space)
+    // MARK: - Global Hotkeys (Configurable via ShortcutService)
 
     private func registerGlobalHotKey() {
-        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        ShortcutService.shared.start { [weak self] action in
+            guard let self else { return }
+            self.handleShortcutAction(action)
+        }
+    }
 
-        InstallEventHandler(
-            GetApplicationEventTarget(),
-            { _, event, userData in
-                guard let userData, let event else { return noErr }
-                let delegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
-                var hkID = EventHotKeyID()
-                GetEventParameter(
-                    event,
-                    EventParamName(kEventParamDirectObject),
-                    EventParamType(typeEventHotKeyID),
-                    nil,
-                    MemoryLayout<EventHotKeyID>.size,
-                    nil,
-                    &hkID
-                )
-                DispatchQueue.main.async {
-                    if hkID.id == 2 {
-                        TerminalWindowController.toggle(appState: delegate.appState)
-                    } else {
-                        delegate.appState.toggleFromHotkey()
-                    }
+    private func handleShortcutAction(_ action: AppShortcutAction) {
+        switch action {
+        case .toggleNotch:
+            appState.toggleFromHotkey()
+        case .toggleTerminal:
+            TerminalWindowController.toggle(appState: appState)
+        case .togglePin:
+            appState.togglePin()
+        case .tabMedia, .tabMixer, .tabOutput, .tabMic, .tabVPN, .tabTimer, .tabClipboard, .tabNotifications:
+            if let tab = action.notchTab {
+                if appState.displayState == .expanded && appState.selectedTab == tab {
+                    appState.toggleFromHotkey()
+                } else {
+                    appState.selectedTab = tab
+                    appState.isPinned = true
+                    appState.setDisplayState(.expanded)
                 }
-                return noErr
-            },
-            1,
-            &eventType,
-            selfPtr,
-            &hotKeyHandlerRef
-        )
-
-        let hotKeyID = EventHotKeyID(signature: 0x4F564C59, id: 1) // 'OVLY'
-        // kVK_Space = 49, optionKey = 2048
-        RegisterEventHotKey(UInt32(kVK_Space), UInt32(optionKey), hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
-
-        let termHotKeyID = EventHotKeyID(signature: 0x4F564C59, id: 2)
-        // kVK_ANSI_T = 17, optionKey = 2048
-        RegisterEventHotKey(UInt32(kVK_ANSI_T), UInt32(optionKey), termHotKeyID, GetApplicationEventTarget(), 0, &termHotKeyRef)
+            }
+        case .openPairPlay:
+            PairPlayWindowController.show(appState: appState, initialSection: .multiOutput)
+        case .openVPNConfigs:
+            VPNConfigWindowController.show(vpnService: appState.vpnService)
+        case .openSettings:
+            SettingsWindowController.show(appState: appState)
+        }
     }
 }

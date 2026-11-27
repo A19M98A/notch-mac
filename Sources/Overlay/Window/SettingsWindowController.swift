@@ -22,7 +22,7 @@ final class SettingsWindowController: NSWindowController {
 
     private init(appState: AppState) {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 550),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 560),
             styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -44,9 +44,10 @@ final class SettingsWindowController: NSWindowController {
             .environmentObject(appState.perAppMixer)
             .environmentObject(appState.mediaService)
             .environmentObject(appState.updateService)
+            .environmentObject(ShortcutService.shared)
 
         let hosting = NSHostingView(rootView: root)
-        hosting.frame = NSRect(x: 0, y: 0, width: 520, height: 550)
+        hosting.frame = NSRect(x: 0, y: 0, width: 560, height: 560)
         hosting.autoresizingMask = [.width, .height]
         window.contentView = hosting
         super.init(window: window)
@@ -60,6 +61,7 @@ final class SettingsWindowController: NSWindowController {
 private enum SettingsSection: String, CaseIterable, Identifiable {
     case modules = "Modules"
     case appearance = "Appearance"
+    case shortcuts = "Shortcuts"
     case permissions = "Permissions"
     case about = "About"
 
@@ -69,6 +71,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         switch self {
         case .modules: return "square.grid.2x2"
         case .appearance: return "slider.horizontal.3"
+        case .shortcuts: return "command"
         case .permissions: return "checkmark.shield"
         case .about: return "info.circle"
         }
@@ -82,6 +85,7 @@ struct NotchSettingsView: View {
     @EnvironmentObject var perAppMixer: PerAppAudioMixer
     @EnvironmentObject var mediaService: MediaRemoteService
     @EnvironmentObject var updateService: UpdateService
+    @EnvironmentObject var shortcutService: ShortcutService
 
     @State private var section: SettingsSection = .modules
     @State private var axTrusted: Bool = AXIsProcessTrusted()
@@ -89,6 +93,8 @@ struct NotchSettingsView: View {
     @State private var copiedHint: String? = nil
     @State private var isSettingUpSigning: Bool = false
     @State private var isInstallingHelper: Bool = false
+    @State private var recordingAction: AppShortcutAction? = nil
+    @State private var keyMonitor: Any? = nil
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: 22, style: .continuous)
@@ -147,7 +153,7 @@ struct NotchSettingsView: View {
                                             .frame(width: 6, height: 6)
                                     }
                                 }
-                                .padding(.horizontal, 11)
+                                .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
                                 .background(Capsule().fill(section == sec ? Color.white.opacity(0.18) : Color.clear))
                                 .foregroundStyle(section == sec ? .white : .white.opacity(0.55))
@@ -167,6 +173,8 @@ struct NotchSettingsView: View {
                         modulesView
                     case .appearance:
                         appearanceView
+                    case .shortcuts:
+                        shortcutsView
                     case .permissions:
                         permissionsView
                     case .about:
@@ -178,11 +186,12 @@ struct NotchSettingsView: View {
             .padding(.top, 32)
             .padding(.bottom, 16)
         }
-        .frame(width: 520, height: 550)
+        .frame(width: 560, height: 560)
         .clipShape(shape)
         .ignoresSafeArea(.container, edges: .top)
         .preferredColorScheme(.dark)
         .onAppear { refreshPermissions() }
+        .onDisappear { stopRecordingShortcut() }
     }
 
     // MARK: - 1. Modules Tab
@@ -409,7 +418,152 @@ struct NotchSettingsView: View {
         }
     }
 
-    // MARK: - 3. Permissions & System Status Tab
+    // MARK: - 3. Global Shortcuts Tab
+
+    private var shortcutsView: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Click any shortcut to record a global hotkey (requires ⌘, ⌥, ⌃, or ⇧)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.55))
+                Spacer()
+                Button("Reset Defaults") {
+                    stopRecordingShortcut()
+                    shortcutService.resetToDefaults()
+                    flashHint("Shortcuts reset to defaults")
+                }
+                .font(.system(size: 10, weight: .bold))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(Color.white.opacity(0.12)))
+                .foregroundStyle(.white)
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 18)
+
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(["Main Controls", "Notch Tabs", "Windows"], id: \.self) { category in
+                        let actions = AppShortcutAction.allCases.filter { $0.category == category }
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(category.uppercased())
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(.white.opacity(0.45))
+                                .padding(.leading, 4)
+
+                            ForEach(actions) { action in
+                                shortcutRow(action)
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 18)
+                .padding(.bottom, 6)
+            }
+        }
+    }
+
+    private func shortcutRow(_ action: AppShortcutAction) -> some View {
+        let isRecordingThis = recordingAction == action
+        let binding = shortcutService.binding(for: action)
+
+        return HStack(spacing: 10) {
+            Image(systemName: action.sfSymbol)
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(.cyan)
+                .frame(width: 24, height: 24)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.cyan.opacity(0.14)))
+
+            Text(action.title)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.white)
+
+            Spacer()
+
+            HStack(spacing: 5) {
+                Button {
+                    if isRecordingThis {
+                        stopRecordingShortcut()
+                    } else {
+                        startRecordingShortcut(for: action)
+                    }
+                } label: {
+                    Text(isRecordingThis ? "Press keys…" : (binding?.displayString ?? "Record"))
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(isRecordingThis ? .cyan : (binding != nil ? .white : .white.opacity(0.45)))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .frame(minWidth: 86)
+                        .background(
+                            RoundedRectangle(cornerRadius: 7)
+                                .fill(isRecordingThis ? Color.cyan.opacity(0.18) : Color.white.opacity(0.08))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 7)
+                                .stroke(isRecordingThis ? Color.cyan : Color.white.opacity(0.10), lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+
+                if binding != nil && !isRecordingThis {
+                    Button {
+                        shortcutService.setBinding(nil, for: action)
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 13))
+                            .foregroundStyle(.white.opacity(0.35))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear shortcut")
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.05)))
+    }
+
+    private func startRecordingShortcut(for action: AppShortcutAction) {
+        stopRecordingShortcut()
+        recordingAction = action
+        shortcutService.isRecording = true
+
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // Esc (53) cancels recording
+            if event.keyCode == 53 {
+                stopRecordingShortcut()
+                return nil
+            }
+            let mods = KeyShortcut.carbonModifiers(from: event.modifierFlags)
+            // Backspace (51) or Forward Delete (117) without modifiers clears the shortcut
+            if mods == 0 && (event.keyCode == 51 || event.keyCode == 117) {
+                shortcutService.setBinding(nil, for: action)
+                stopRecordingShortcut()
+                return nil
+            }
+            // Require at least one modifier key (Cmd, Option, Control, or Shift)
+            guard mods != 0 else {
+                NSSound.beep()
+                return nil
+            }
+            let captured = KeyShortcut(keyCode: UInt32(event.keyCode), carbonModifiers: mods)
+            shortcutService.setBinding(captured, for: action)
+            flashHint("Set \(action.title) to \(captured.displayString)")
+            stopRecordingShortcut()
+            return nil
+        }
+    }
+
+    private func stopRecordingShortcut() {
+        if let monitor = keyMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyMonitor = nil
+        }
+        recordingAction = nil
+        shortcutService.isRecording = false
+    }
+
+    // MARK: - 4. Permissions & System Status Tab
 
     private var permissionsView: some View {
         ScrollView(.vertical, showsIndicators: false) {

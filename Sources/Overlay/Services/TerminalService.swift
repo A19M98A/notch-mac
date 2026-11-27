@@ -130,6 +130,13 @@ struct TerminalPreferences: Codable, Equatable {
     var singleScreenOnly: Bool = false
     var customX: Double? = nil
     var customY: Double? = nil
+    var cursorShape: String = "block"           // "block", "underline", "bar"
+    var cursorBlink: Bool = true
+    var cursorColorHex: String = "theme"        // "theme" or hex like "#FFFFFF"
+    var lineSpacing: Double = 1.0               // 1.0 ... 1.4
+    var bellStyle: String = "visual"            // "none", "visual", "sound", "soundAndVisual"
+    var optionAsMeta: Bool = true
+    var allowMouseReporting: Bool = true
 
     init() {}
 
@@ -148,6 +155,13 @@ struct TerminalPreferences: Codable, Equatable {
         singleScreenOnly = try c.decodeIfPresent(Bool.self, forKey: .singleScreenOnly) ?? false
         customX = try c.decodeIfPresent(Double.self, forKey: .customX)
         customY = try c.decodeIfPresent(Double.self, forKey: .customY)
+        cursorShape = try c.decodeIfPresent(String.self, forKey: .cursorShape) ?? "block"
+        cursorBlink = try c.decodeIfPresent(Bool.self, forKey: .cursorBlink) ?? true
+        cursorColorHex = try c.decodeIfPresent(String.self, forKey: .cursorColorHex) ?? "theme"
+        lineSpacing = try c.decodeIfPresent(Double.self, forKey: .lineSpacing) ?? 1.0
+        bellStyle = try c.decodeIfPresent(String.self, forKey: .bellStyle) ?? "visual"
+        optionAsMeta = try c.decodeIfPresent(Bool.self, forKey: .optionAsMeta) ?? true
+        allowMouseReporting = try c.decodeIfPresent(Bool.self, forKey: .allowMouseReporting) ?? true
     }
 }
 
@@ -335,8 +349,44 @@ final class TerminalService: ObservableObject {
         tv.installColors(theme.ansi16)
         tv.nativeForegroundColor = theme.foreground
         tv.nativeBackgroundColor = theme.background.withAlphaComponent(CGFloat(prefs.opacity))
-        tv.caretColor = theme.cursor
+        tv.caretColor = resolvedCursorColor(theme: theme)
+        tv.setCursorStyle(resolvedCursorStyle())
+        tv.lineSpacing = CGFloat(prefs.lineSpacing)
+        tv.bellStyle = resolvedBellStyle()
+        tv.optionAsMetaKey = prefs.optionAsMeta
+        tv.allowMouseReporting = prefs.allowMouseReporting
         applyFont(to: tab)
+    }
+
+    private func resolvedCursorStyle() -> CursorStyle {
+        switch (prefs.cursorShape, prefs.cursorBlink) {
+        case ("underline", true): return .blinkUnderline
+        case ("underline", false): return .steadyUnderline
+        case ("bar", true): return .blinkBar
+        case ("bar", false): return .steadyBar
+        case ("block", false): return .steadyBlock
+        default: return .blinkBlock
+        }
+    }
+
+    private func resolvedCursorColor(theme: TerminalTheme) -> NSColor {
+        if prefs.cursorColorHex == "theme" {
+            return theme.cursor
+        }
+        let cleaned = prefs.cursorColorHex.trimmingCharacters(in: CharacterSet(charactersIn: "#"))
+        if let val = UInt32(cleaned, radix: 16) {
+            return TerminalTheme.hex(val)
+        }
+        return theme.cursor
+    }
+
+    private func resolvedBellStyle() -> BellStyle {
+        switch prefs.bellStyle {
+        case "none": return .none
+        case "sound": return .sound
+        case "soundAndVisual": return .soundAndVisual
+        default: return .visual
+        }
     }
 
     @MainActor

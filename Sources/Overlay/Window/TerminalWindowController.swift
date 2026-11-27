@@ -529,24 +529,69 @@ private struct TerminalOptionsPopover: View {
     let onSnapToNotch: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 11) {
-            Text("Terminal Options")
-                .font(.system(size: 12.5, weight: .bold))
-                .foregroundColor(.white)
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 11) {
+                Text("Terminal Options")
+                    .font(.system(size: 12.5, weight: .bold))
+                    .foregroundColor(.white)
 
-            // Color Palette Swatches
-            VStack(alignment: .leading, spacing: 5) {
-                Text("Color Palette")
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundColor(Color.white.opacity(0.6))
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 110), spacing: 6)], spacing: 6) {
-                    ForEach(TerminalTheme.allThemes) { theme in
-                        themeButton(theme)
+                // Color Palette Swatches
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Color Palette")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundColor(Color.white.opacity(0.6))
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 110), spacing: 6)], spacing: 6) {
+                        ForEach(TerminalTheme.allThemes) { theme in
+                            themeButton(theme)
+                        }
                     }
                 }
-            }
 
-            Divider().overlay(Color.white.opacity(0.08))
+                Divider().overlay(Color.white.opacity(0.08))
+
+                // Cursor Style, Blink & Color
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack(spacing: 8) {
+                        Text("Cursor")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(Color.white.opacity(0.7))
+                            .frame(width: 68, alignment: .leading)
+
+                        HStack(spacing: 4) {
+                            cursorShapeBtn("Block", shape: "block", glyph: "█")
+                            cursorShapeBtn("Line", shape: "underline", glyph: "▁")
+                            cursorShapeBtn("Bar", shape: "bar", glyph: "▏")
+                        }
+
+                        Spacer()
+
+                        Toggle("Blink", isOn: Binding(
+                            get: { terminalService.prefs.cursorBlink },
+                            set: { v in terminalService.updatePreferences { $0.cursorBlink = v } }
+                        ))
+                        .toggleStyle(.checkbox)
+                        .font(.system(size: 10.5, weight: .medium))
+                    }
+
+                    HStack(spacing: 8) {
+                        Text("Cursor Color")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundColor(Color.white.opacity(0.6))
+                            .frame(width: 68, alignment: .leading)
+
+                        HStack(spacing: 6) {
+                            cursorColorSwatch("theme", label: "Auto", color: Color(nsColor: terminalService.currentTheme.cursor))
+                            cursorColorSwatch("#FFFFFF", label: "White", color: .white)
+                            cursorColorSwatch("#38BDF8", label: "Cyan", color: Color(red: 0.22, green: 0.74, blue: 0.97))
+                            cursorColorSwatch("#4ADE80", label: "Green", color: Color(red: 0.29, green: 0.87, blue: 0.50))
+                            cursorColorSwatch("#FBBF24", label: "Amber", color: Color(red: 0.98, green: 0.75, blue: 0.14))
+                            cursorColorSwatch("#FF79C6", label: "Pink", color: Color(red: 1.0, green: 0.47, blue: 0.78))
+                        }
+                        Spacer()
+                    }
+                }
+
+                Divider().overlay(Color.white.opacity(0.08))
 
             // Primary Font & Size
             HStack(spacing: 8) {
@@ -642,37 +687,128 @@ private struct TerminalOptionsPopover: View {
 
             Divider().overlay(Color.white.opacity(0.08))
 
-            // Window Placement & Full-Screen Behavior
-            Toggle("Always on Top (Even Full-Screen)", isOn: Binding(
-                get: { terminalService.prefs.alwaysOnTopFullScreen },
-                set: { v in
-                    terminalService.updatePreferences { $0.alwaysOnTopFullScreen = v }
-                    onBehaviorChanged()
+                // Line Spacing
+                HStack(spacing: 8) {
+                    Text("Line Space")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(Color.white.opacity(0.7))
+                        .frame(width: 68, alignment: .leading)
+                    Slider(value: Binding(
+                        get: { terminalService.prefs.lineSpacing },
+                        set: { v in terminalService.updatePreferences { $0.lineSpacing = v } }
+                    ), in: 1.0...1.4, step: 0.05)
+                    .tint(.cyan)
+                    Text(String(format: "%.2fx", terminalService.prefs.lineSpacing))
+                        .font(.system(size: 10, design: .monospaced))
+                        .frame(width: 34, alignment: .trailing)
                 }
-            ))
-            .font(.system(size: 11, weight: .medium))
 
-            Toggle("Single Screen / Space Only", isOn: Binding(
-                get: { terminalService.prefs.singleScreenOnly },
-                set: { v in
-                    terminalService.updatePreferences { $0.singleScreenOnly = v }
-                    onBehaviorChanged()
+                // Bell Style
+                HStack(spacing: 8) {
+                    Text("Bell")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(Color.white.opacity(0.7))
+                        .frame(width: 68, alignment: .leading)
+                    Picker("", selection: Binding(
+                        get: { terminalService.prefs.bellStyle },
+                        set: { v in terminalService.updatePreferences { $0.bellStyle = v } }
+                    )) {
+                        Text("Off").tag("none")
+                        Text("Visual").tag("visual")
+                        Text("Sound").tag("sound")
+                        Text("Both").tag("soundAndVisual")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
                 }
-            ))
-            .font(.system(size: 11, weight: .medium))
 
-            if !terminalService.prefs.isDockedUnderNotch {
-                Button("Snap Back Under Notch") {
-                    onSnapToNotch()
+                // Window Placement & Full-Screen Behavior
+                Toggle("Option (⌥) as Meta Key", isOn: Binding(
+                    get: { terminalService.prefs.optionAsMeta },
+                    set: { v in terminalService.updatePreferences { $0.optionAsMeta = v } }
+                ))
+                .font(.system(size: 11, weight: .medium))
+
+                Toggle("Mouse Reporting (nvim / tmux)", isOn: Binding(
+                    get: { terminalService.prefs.allowMouseReporting },
+                    set: { v in terminalService.updatePreferences { $0.allowMouseReporting = v } }
+                ))
+                .font(.system(size: 11, weight: .medium))
+
+                Toggle("Always on Top (Even Full-Screen)", isOn: Binding(
+                    get: { terminalService.prefs.alwaysOnTopFullScreen },
+                    set: { v in
+                        terminalService.updatePreferences { $0.alwaysOnTopFullScreen = v }
+                        onBehaviorChanged()
+                    }
+                ))
+                .font(.system(size: 11, weight: .medium))
+
+                Toggle("Single Screen / Space Only", isOn: Binding(
+                    get: { terminalService.prefs.singleScreenOnly },
+                    set: { v in
+                        terminalService.updatePreferences { $0.singleScreenOnly = v }
+                        onBehaviorChanged()
+                    }
+                ))
+                .font(.system(size: 11, weight: .medium))
+
+                if !terminalService.prefs.isDockedUnderNotch {
+                    Button("Snap Back Under Notch") {
+                        onSnapToNotch()
+                    }
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(.cyan)
+                    .buttonStyle(.plain)
                 }
-                .font(.system(size: 11, weight: .bold))
-                .foregroundColor(.cyan)
-                .buttonStyle(.plain)
             }
+            .padding(14)
         }
-        .padding(14)
-        .frame(width: 310)
+        .frame(width: 330)
+        .frame(maxHeight: 500)
         .preferredColorScheme(.dark)
+    }
+
+    private func cursorShapeBtn(_ title: String, shape: String, glyph: String) -> some View {
+        let selected = terminalService.prefs.cursorShape == shape
+        return Button {
+            terminalService.updatePreferences { $0.cursorShape = shape }
+        } label: {
+            HStack(spacing: 3) {
+                Text(glyph)
+                    .font(.system(size: 9.5, design: .monospaced))
+                Text(title)
+                    .font(.system(size: 10, weight: selected ? .bold : .medium))
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(selected ? 0.16 : 0.06)))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(selected ? Color.cyan : Color.white.opacity(0.08), lineWidth: 1))
+            .foregroundColor(.white)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func cursorColorSwatch(_ hex: String, label: String, color: Color) -> some View {
+        let selected = terminalService.prefs.cursorColorHex == hex
+        return Button {
+            terminalService.updatePreferences { $0.cursorColorHex = hex }
+        } label: {
+            Circle()
+                .fill(color)
+                .frame(width: 15, height: 15)
+                .overlay(
+                    Circle()
+                        .stroke(selected ? Color.white : Color.white.opacity(0.2), lineWidth: selected ? 2 : 1)
+                )
+                .overlay(
+                    hex == "theme"
+                        ? Text("A").font(.system(size: 8, weight: .bold)).foregroundColor(.black.opacity(0.75))
+                        : nil
+                )
+        }
+        .buttonStyle(.plain)
+        .help(label)
     }
 
     private func themeButton(_ theme: TerminalTheme) -> some View {
