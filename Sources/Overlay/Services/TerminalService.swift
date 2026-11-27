@@ -350,7 +350,7 @@ final class TerminalService: ObservableObject {
         tv.nativeForegroundColor = theme.foreground
         tv.nativeBackgroundColor = theme.background.withAlphaComponent(CGFloat(prefs.opacity))
         tv.caretColor = resolvedCursorColor(theme: theme)
-        tv.setCursorStyle(resolvedCursorStyle())
+        tv.feed(text: resolvedCursorStyleEscape())
         tv.lineSpacing = CGFloat(prefs.lineSpacing)
         tv.bellStyle = resolvedBellStyle()
         tv.optionAsMetaKey = prefs.optionAsMeta
@@ -358,14 +358,14 @@ final class TerminalService: ObservableObject {
         applyFont(to: tab)
     }
 
-    private func resolvedCursorStyle() -> CursorStyle {
+    private func resolvedCursorStyleEscape() -> String {
         switch (prefs.cursorShape, prefs.cursorBlink) {
-        case ("underline", true): return .blinkUnderline
-        case ("underline", false): return .steadyUnderline
-        case ("bar", true): return .blinkBar
-        case ("bar", false): return .steadyBar
-        case ("block", false): return .steadyBlock
-        default: return .blinkBlock
+        case ("block", false): return "\u{1B}[2 q"
+        case ("underline", true): return "\u{1B}[3 q"
+        case ("underline", false): return "\u{1B}[4 q"
+        case ("bar", true): return "\u{1B}[5 q"
+        case ("bar", false): return "\u{1B}[6 q"
+        default: return "\u{1B}[1 q"
         }
     }
 
