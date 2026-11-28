@@ -20,6 +20,12 @@ private struct ActiveVPNSession: Codable {
     let startedAt: Date
 }
 
+enum RuleAddResult {
+    case added(VPNRule)
+    case duplicate(VPNRule)
+    case invalid
+}
+
 final class VPNService: ObservableObject {
     @Published var store = VPNStoreData()
     @Published var systemVPNs: [VPNServerConfig] = []
@@ -27,6 +33,9 @@ final class VPNService: ObservableObject {
     @Published var pings: [String: Int] = [:] // server.id -> ms (-1 = timeout)
     @Published var isBusy: Bool = false
     @Published var isPinging: Bool = false
+    @Published var isRefreshingBypass: Bool = false
+    @Published var lastBypassRefreshAt: Date? = nil
+    @Published var resolvedIPsByRuleID: [String: [String]] = [:]
     @Published var feedbackMessage: String? = nil
     @Published var feedbackIsError: Bool = false
 
@@ -436,28 +445,189 @@ esac
         saveStore()
     }
 
-    func addRule(target: String, type: VPNRuleType? = nil, label: String = "") {
-        let cleaned = target.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleaned.isEmpty else { return }
+    static func normalizeRuleTarget(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return "" }
+        if s.lowercased().hasPrefix("service:") {
+            return s.lowercased()
+        }
+        // If the user pasted a full URL (e.g. https://www.youtube.com/watch?v=...), extract the host
+        if let url = URL(string: s), let host = url.host, !host.isEmpty {
+            s = host
+        } else if s.lowercased().hasPrefix("http://") || s.lowercased().hasPrefix("https://") {
+            s = s.replacingOccurrences(of: "^https?://", with: "", options: [.regularExpression, .caseInsensitive])
+            if let slash = s.firstIndex(of: "/") { s = String(s[..<slash]) }
+            if let q = s.firstIndex(of: "?") { s = String(s[..<q]) }
+        } else if !s.contains("/") {
+            // Domain or IP without path
+            s = s.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        }
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    @discardableResult
+    func addRuleResult(target: String, type: VPNRuleType? = nil, label: String = "", tag: String = "") -> RuleAddResult {
+        let cleaned = Self.normalizeRuleTarget(target)
+        guard !cleaned.isEmpty else { return .invalid }
+
+        let key = cleaned.lowercased()
+        if let existing = activeRules.first(where: { Self.normalizeRuleTarget($0.target).lowercased() == key }) {
+            setFeedback("Already exists: \(existing.target) (\(existing.resolvedCategory))", isError: true)
+            return .duplicate(existing)
+        }
 
         let resolvedType: VPNRuleType
         if let type {
             resolvedType = type
-        } else if cleaned.lowercased().hasPrefix("service:") {
+        } else if key.hasPrefix("service:") {
             resolvedType = .service
-        } else if cleaned.contains("/") || cleaned.allSatisfy({ $0.isNumber || $0 == "." }) {
+        } else if cleaned.contains("/") || cleaned.allSatisfy({ $0.isNumber || $0 == "." || $0 == ":" }) {
             resolvedType = .ipCidr
         } else {
             resolvedType = .domain
         }
 
-        let rule = VPNRule(target: cleaned, type: resolvedType, label: label)
+        let cleanTag = tag.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rule = VPNRule(target: cleaned, type: resolvedType, label: label, tag: cleanTag)
         if store.mode == .vpnDefault {
             store.bypassRules.append(rule)
         } else {
             store.vpnRules.append(rule)
         }
         saveStore()
+        setFeedback("Added \(cleaned)")
+        return .added(rule)
+    }
+
+    func addRule(target: String, type: VPNRuleType? = nil, label: String = "", tag: String = "") {
+        _ = addRuleResult(target: target, type: type, label: label, tag: tag)
+    }
+
+    func updateRuleTag(_ rule: VPNRule, tag: String) {
+        let cleanTag = tag.trimmingCharacters(in: .whitespacesAndNewlines)
+        if store.mode == .vpnDefault {
+            if let idx = store.bypassRules.firstIndex(where: { $0.id == rule.id }) {
+                store.bypassRules[idx].tag = cleanTag
+            }
+        } else {
+            if let idx = store.vpnRules.firstIndex(where: { $0.id == rule.id }) {
+                store.vpnRules[idx].tag = cleanTag
+            }
+        }
+        saveStore()
+    }
+
+    func setRulesEnabled(_ rules: [VPNRule], enabled: Bool) {
+        let ids = Set(rules.map(\.id))
+        if store.mode == .vpnDefault {
+            for i in store.bypassRules.indices where ids.contains(store.bypassRules[i].id) {
+                store.bypassRules[i].enabled = enabled
+            }
+        } else {
+            for i in store.vpnRules.indices where ids.contains(store.vpnRules[i].id) {
+                store.vpnRules[i].enabled = enabled
+            }
+        }
+        saveStore()
+        setFeedback("\(enabled ? "Enabled" : "Disabled") \(ids.count) rule(s)")
+    }
+
+    func deleteRules(_ rules: [VPNRule]) {
+        let ids = Set(rules.map(\.id))
+        if store.mode == .vpnDefault {
+            store.bypassRules.removeAll { ids.contains($0.id) }
+        } else {
+            store.vpnRules.removeAll { ids.contains($0.id) }
+        }
+        saveStore()
+        setFeedback("Removed \(ids.count) rule(s)")
+    }
+
+    /// Flushes DNS cache, resolves fresh IPs for all enabled domain rules, updates Google IP ranges if used,
+    /// and reloads the active sing-box tunnel if currently connected so bypass rules take effect immediately.
+    func refreshBypassAndIPs() {
+        guard !isRefreshingBypass else { return }
+        isRefreshingBypass = true
+        setFeedback("Refreshing DNS & bypass IPs…")
+
+        let rulesSnapshot = activeRules.filter(\.enabled)
+        let hasGoogleService = rulesSnapshot.contains { $0.target.lowercased() == "service:google" }
+
+        if hasGoogleService {
+            VPNRuleServices.fetchGoogleRanges { _, _ in }
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            // Flush local DNS cache so domain resolutions get fresh IPs
+            _ = self.runProcess(executable: "/usr/bin/dscacheutil", arguments: ["-flushcache"])
+
+            var resolvedMap: [String: [String]] = [:]
+            var totalIPs = 0
+            let domainRules = rulesSnapshot.filter { $0.type == .domain }
+
+            for rule in domainRules {
+                let ips = Self.resolveIPv4Addresses(for: rule.target)
+                if !ips.isEmpty {
+                    resolvedMap[rule.id] = ips
+                    totalIPs += ips.count
+                }
+            }
+
+            DispatchQueue.main.async {
+                for (id, ips) in resolvedMap {
+                    self.resolvedIPsByRuleID[id] = ips
+                }
+                self.lastBypassRefreshAt = Date()
+
+                // If sing-box is currently connected, rebuild config & reload it so new rules/IPs apply live
+                if self.liveStatus.connected,
+                   self.liveStatus.providerKind == "sing-box",
+                   let activeID = self.liveStatus.activeServerID,
+                   let srv = self.allServers.first(where: { $0.id == activeID }) {
+                    self.isRefreshingBypass = false
+                    self.connectServer(srv)
+                    self.setFeedback("Refreshed \(totalIPs) IPs (\(domainRules.count) domains) & reloaded bypass")
+                } else {
+                    self.isRefreshingBypass = false
+                    self.setFeedback("Refreshed \(totalIPs) IPs across \(domainRules.count) domain(s)")
+                }
+            }
+        }
+    }
+
+    private static func resolveIPv4Addresses(for host: String) -> [String] {
+        var hints = addrinfo(
+            ai_flags: 0,
+            ai_family: AF_INET,
+            ai_socktype: SOCK_STREAM,
+            ai_protocol: 0,
+            ai_addrlen: 0,
+            ai_canonname: nil,
+            ai_addr: nil,
+            ai_next: nil
+        )
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &result) == 0, let first = result else {
+            return []
+        }
+        defer { freeaddrinfo(first) }
+
+        var ips: [String] = []
+        var ptr: UnsafeMutablePointer<addrinfo>? = first
+        while let current = ptr {
+            if let addr = current.pointee.ai_addr {
+                var hostBuffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                if getnameinfo(addr, socklen_t(current.pointee.ai_addrlen), &hostBuffer, socklen_t(hostBuffer.count), nil, 0, NI_NUMERICHOST) == 0 {
+                    let ip = String(cString: hostBuffer)
+                    if !ips.contains(ip) {
+                        ips.append(ip)
+                    }
+                }
+            }
+            ptr = current.pointee.ai_next
+        }
+        return ips
     }
 
     func addGoogleServiceRule() {

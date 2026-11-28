@@ -20,6 +20,17 @@ private enum SortMode: String {
     case name = "Name"
 }
 
+private enum RuleKindFilter: String, CaseIterable, Identifiable {
+    case all = "All"
+    case domain = "Domain"
+    case ipCidr = "IP / CIDR"
+    case service = "Service"
+    case enabled = "Active"
+    case disabled = "Off"
+
+    var id: String { rawValue }
+}
+
 struct VPNConfigWindowView: View {
     @EnvironmentObject var vpnService: VPNService
     @State private var activeTab: VPNManagerTab = .configs
@@ -37,7 +48,14 @@ struct VPNConfigWindowView: View {
     // Rules tab state
     @State private var newRuleTarget: String = ""
     @State private var newRuleLabel: String = ""
+    @State private var newRuleTag: String = ""
     @State private var newRuleType: VPNRuleType = .domain
+    @State private var ruleSearchQuery: String = ""
+    @State private var selectedRuleCategory: String = "All"
+    @State private var selectedRuleKindFilter: RuleKindFilter = .all
+    @State private var duplicateRuleAlert: String? = nil
+    @State private var editingTagRule: VPNRule? = nil
+    @State private var editingTagText: String = ""
     @State private var showSDRSheet: Bool = false
     @State private var sdrPops: [SDRPop] = []
     @State private var isLoadingSDR: Bool = false
@@ -523,14 +541,64 @@ struct VPNConfigWindowView: View {
         )
     }
 
-    // MARK: - Rules Screen (Copy Bypass Rules from ocpanel + Live IP Ranges + SDR)
+    // MARK: - Rules Screen (Search, Auto-Categories, Tagging, Duplicate Guard & Live Bypass Refresh)
+
+    private var ruleCategories: [(name: String, count: Int)] {
+        let rules = vpnService.activeRules
+        var counts: [String: Int] = [:]
+        for r in rules {
+            counts[r.resolvedCategory, default: 0] += 1
+        }
+        let sorted = counts.keys.sorted { a, b in
+            let ca = counts[a] ?? 0
+            let cb = counts[b] ?? 0
+            if ca != cb { return ca > cb }
+            return a.localizedCaseInsensitiveCompare(b) == .orderedAscending
+        }
+        return [("All", rules.count)] + sorted.map { ($0, counts[$0] ?? 0) }
+    }
+
+    private var filteredRules: [VPNRule] {
+        let q = ruleSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return vpnService.activeRules.filter { rule in
+            if selectedRuleCategory != "All" && rule.resolvedCategory != selectedRuleCategory {
+                return false
+            }
+            switch selectedRuleKindFilter {
+            case .all: break
+            case .domain: if rule.type != .domain { return false }
+            case .ipCidr: if rule.type != .ipCidr { return false }
+            case .service: if rule.type != .service { return false }
+            case .enabled: if !rule.enabled { return false }
+            case .disabled: if rule.enabled { return false }
+            }
+            if !q.isEmpty {
+                let ips = (vpnService.resolvedIPsByRuleID[rule.id] ?? []).joined(separator: " ")
+                let hay = "\(rule.target) \(rule.label) \(rule.tag) \(rule.resolvedCategory) \(ips)".lowercased()
+                if !hay.contains(q) { return false }
+            }
+            return true
+        }
+    }
 
     private var rulesManagerView: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
+        let allRules = vpnService.activeRules
+        let visibleRules = filteredRules
+        let enabledCount = allRules.filter(\.enabled).count
+        let domainCount = allRules.filter { $0.type == .domain }.count
+        let ipCount = allRules.filter { $0.type == .ipCidr }.count
+        let resolvedTotal = vpnService.resolvedIPsByRuleID.values.reduce(0) { $0 + $1.count }
+
+        return VStack(alignment: .leading, spacing: 8) {
+            // Top Mode Switcher + Refresh Bypass + Import + Bulk Actions
+            HStack(spacing: 8) {
                 Picker("", selection: Binding(
                     get: { vpnService.store.mode },
-                    set: { vpnService.setMode($0) }
+                    set: {
+                        vpnService.setMode($0)
+                        selectedRuleCategory = "All"
+                        duplicateRuleAlert = nil
+                    }
                 )) {
                     ForEach(VPNRouteMode.allCases) { m in
                         Text(m.shortTitle).tag(m)
@@ -539,56 +607,157 @@ struct VPNConfigWindowView: View {
                 .pickerStyle(.segmented)
 
                 Button {
+                    vpnService.refreshBypassAndIPs()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 10, weight: .bold))
+                        Text(vpnService.isRefreshingBypass ? "Refreshing…" : "Refresh IPs")
+                            .font(.system(size: 10, weight: .bold))
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(Color.green.opacity(vpnService.isRefreshingBypass ? 0.14 : 0.22)))
+                    .foregroundStyle(.green)
+                }
+                .buttonStyle(.plain)
+                .disabled(vpnService.isRefreshingBypass)
+                .help("Flush DNS, resolve fresh IPs for domain rules & reload live bypass")
+
+                Button {
                     vpnService.importBypassRulesFromOCPanel()
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "tray.and.arrow.down")
                             .font(.system(size: 10, weight: .bold))
-                        Text("Copy ocpanel Bypass")
+                        Text("Copy ocpanel")
                             .font(.system(size: 10, weight: .bold))
                     }
-                    .padding(.horizontal, 10)
+                    .padding(.horizontal, 9)
                     .padding(.vertical, 6)
                     .background(Capsule().fill(Color.white.opacity(0.12)))
                     .foregroundStyle(.white)
                 }
                 .buttonStyle(.plain)
-                .help("Copy only bypass rules from ~/.config/ocpanel/config.json")
+                .help("Copy bypass rules from ~/.config/ocpanel/config.json")
+
+                Menu {
+                    Button("Enable Filtered (\(visibleRules.count))") {
+                        vpnService.setRulesEnabled(visibleRules, enabled: true)
+                    }
+                    Button("Disable Filtered (\(visibleRules.count))") {
+                        vpnService.setRulesEnabled(visibleRules, enabled: false)
+                    }
+                    Divider()
+                    Button("Export Backup JSON…") {
+                        vpnService.exportJSONWithDialog()
+                    }
+                    Button("Import Backup JSON…") {
+                        vpnService.importJSONWithDialog()
+                    }
+                    Divider()
+                    Button("Delete Disabled Rules", role: .destructive) {
+                        let disabled = allRules.filter { !$0.enabled }
+                        vpnService.deleteRules(disabled)
+                    }
+                    Button("Delete Filtered (\(visibleRules.count))", role: .destructive) {
+                        vpnService.deleteRules(visibleRules)
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.75))
+                        .frame(width: 24, height: 24)
+                }
+                .menuStyle(.borderlessButton)
+                .frame(width: 24)
             }
             .padding(.horizontal, 18)
 
-            // Add Rule Row
-            VStack(spacing: 8) {
-                HStack(spacing: 8) {
+            // Stats / Info Strip
+            HStack(spacing: 10) {
+                Label("\(enabledCount)/\(allRules.count) active", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green.opacity(0.9))
+                Text("·").foregroundStyle(.white.opacity(0.3))
+                Text("\(domainCount) domains · \(ipCount) IP/CIDRs")
+                    .foregroundStyle(.white.opacity(0.6))
+                if resolvedTotal > 0 {
+                    Text("·").foregroundStyle(.white.opacity(0.3))
+                    Text("\(resolvedTotal) IPs resolved")
+                        .foregroundStyle(.cyan.opacity(0.85))
+                }
+                Spacer()
+                if let refreshed = vpnService.lastBypassRefreshAt {
+                    Text("Refreshed \(refreshed, style: .time)")
+                        .foregroundStyle(.white.opacity(0.45))
+                }
+            }
+            .font(.system(size: 10, weight: .medium, design: .monospaced))
+            .padding(.horizontal, 18)
+
+            // Add Rule Row + Optional Tag + Duplicate Alert
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 6) {
                     Picker("", selection: $newRuleType) {
                         ForEach(VPNRuleType.allCases) { t in
                             Text(t.label).tag(t)
                         }
                     }
-                    .frame(width: 92)
+                    .frame(width: 88)
 
-                    TextField(newRuleType == .domain ? "e.g. youtube.com" : "e.g. 1.1.1.1/32", text: $newRuleTarget)
+                    TextField(newRuleType == .domain ? "Domain or URL (e.g. youtube.com)" : "e.g. 1.1.1.1/32", text: $newRuleTarget)
                         .textFieldStyle(.plain)
-                        .font(.system(size: 12))
-                        .padding(.horizontal, 10)
+                        .font(.system(size: 11.5))
+                        .padding(.horizontal, 9)
                         .padding(.vertical, 6)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.55)))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(duplicateRuleAlert != nil ? Color.orange.opacity(0.75) : Color.white.opacity(0.10), lineWidth: 1))
+                        .onChange(of: newRuleTarget) { _ in
+                            if duplicateRuleAlert != nil { duplicateRuleAlert = nil }
+                        }
+
+                    TextField("Tag (optional)", text: $newRuleTag)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 11.5))
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 6)
+                        .frame(width: 112)
                         .background(RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.55)))
                         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.10), lineWidth: 1))
 
                     Button {
-                        vpnService.addRule(target: newRuleTarget, type: newRuleType, label: newRuleLabel)
-                        newRuleTarget = ""
-                        newRuleLabel = ""
+                        submitNewRule()
                     } label: {
                         Text("Add")
                             .font(.system(size: 11, weight: .bold))
                             .padding(.horizontal, 12)
                             .padding(.vertical, 6)
-                            .background(Capsule().fill(Color.white.opacity(0.16)))
-                            .foregroundStyle(.white)
+                            .background(Capsule().fill(Color.cyan.opacity(0.28)))
+                            .foregroundStyle(.cyan)
                     }
                     .buttonStyle(.plain)
                     .disabled(newRuleTarget.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+
+                if let dupMsg = duplicateRuleAlert {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.orange)
+                        Text(dupMsg)
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(.orange)
+                        Spacer()
+                        Button("Dismiss") {
+                            duplicateRuleAlert = nil
+                        }
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.6))
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(RoundedRectangle(cornerRadius: 7).fill(Color.orange.opacity(0.14)))
                 }
 
                 // Quick Service Presets
@@ -638,8 +807,62 @@ struct VPNConfigWindowView: View {
             }
             .padding(.horizontal, 18)
 
+            // Search & Kind Filter + Auto-Category Chips
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.white.opacity(0.45))
+                        TextField("Search domain, IP, tag, or note…", text: $ruleSearchQuery)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 11.5))
+                        if !ruleSearchQuery.isEmpty {
+                            Button {
+                                ruleSearchQuery = ""
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.white.opacity(0.45))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.06)))
+
+                    Picker("", selection: $selectedRuleKindFilter) {
+                        ForEach(RuleKindFilter.allCases) { f in
+                            Text(f.rawValue).tag(f)
+                        }
+                    }
+                    .frame(width: 96)
+                }
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 5) {
+                        ForEach(ruleCategories, id: \.name) { cat in
+                            let selected = selectedRuleCategory == cat.name
+                            Button {
+                                selectedRuleCategory = cat.name
+                            } label: {
+                                Text("\(cat.name) (\(cat.count))")
+                                    .font(.system(size: 10, weight: selected ? .bold : .medium))
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 4)
+                                    .background(Capsule().fill(selected ? Color.cyan.opacity(0.24) : Color.white.opacity(0.07)))
+                                    .foregroundStyle(selected ? .cyan : .white.opacity(0.75))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 18)
+
             // Active Rules List
-            if vpnService.activeRules.isEmpty {
+            if allRules.isEmpty {
                 VStack(spacing: 6) {
                     Text(vpnService.store.mode == .vpnDefault ? "No bypass rules yet" : "No VPN rules yet")
                         .font(.system(size: 12, weight: .semibold))
@@ -651,11 +874,27 @@ struct VPNConfigWindowView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.horizontal, 24)
+            } else if visibleRules.isEmpty {
+                VStack(spacing: 6) {
+                    Text("No matching rules")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.55))
+                    Button("Clear Search & Filters") {
+                        ruleSearchQuery = ""
+                        selectedRuleCategory = "All"
+                        selectedRuleKindFilter = .all
+                    }
+                    .font(.system(size: 10.5, weight: .bold))
+                    .foregroundStyle(.cyan)
+                    .buttonStyle(.plain)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 6) {
-                        ForEach(vpnService.activeRules) { rule in
-                            HStack(spacing: 10) {
+                        ForEach(visibleRules) { rule in
+                            let resolvedIPs = vpnService.resolvedIPsByRuleID[rule.id] ?? []
+                            HStack(spacing: 9) {
                                 Toggle("", isOn: Binding(
                                     get: { rule.enabled },
                                     set: { _ in vpnService.toggleRule(rule) }
@@ -671,14 +910,41 @@ struct VPNConfigWindowView: View {
                                     .background(Capsule().fill(Color.cyan.opacity(0.18)))
                                     .foregroundStyle(.cyan)
 
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(rule.target)
-                                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                                        .foregroundStyle(rule.enabled ? .white : .white.opacity(0.4))
-                                    if !rule.label.isEmpty {
-                                        Text(rule.label)
-                                            .font(.system(size: 10))
-                                            .foregroundStyle(.white.opacity(0.45))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack(spacing: 6) {
+                                        Text(rule.target)
+                                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                            .foregroundStyle(rule.enabled ? .white : .white.opacity(0.4))
+                                            .lineLimit(1)
+
+                                        Button {
+                                            editingTagRule = rule
+                                            editingTagText = rule.tag
+                                        } label: {
+                                            Text(rule.resolvedCategory)
+                                                .font(.system(size: 9, weight: .semibold))
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 1.5)
+                                                .background(Capsule().fill(rule.tag.isEmpty ? Color.white.opacity(0.08) : Color.purple.opacity(0.22)))
+                                                .foregroundStyle(rule.tag.isEmpty ? Color.white.opacity(0.65) : Color.purple)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .help("Click to edit tag")
+                                    }
+
+                                    HStack(spacing: 6) {
+                                        if !rule.label.isEmpty {
+                                            Text(rule.label)
+                                                .font(.system(size: 10))
+                                                .foregroundStyle(.white.opacity(0.45))
+                                                .lineLimit(1)
+                                        }
+                                        if !resolvedIPs.isEmpty {
+                                            Text("IP: \(resolvedIPs.prefix(2).joined(separator: ", "))\(resolvedIPs.count > 2 ? " +\(resolvedIPs.count - 2)" : "")")
+                                                .font(.system(size: 9.5, design: .monospaced))
+                                                .foregroundStyle(.green.opacity(0.8))
+                                                .help(resolvedIPs.joined(separator: "\n"))
+                                        }
                                     }
                                 }
 
@@ -701,6 +967,57 @@ struct VPNConfigWindowView: View {
                     .padding(.horizontal, 18)
                 }
             }
+        }
+        .sheet(item: $editingTagRule) { rule in
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Edit Tag for \(rule.target)")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(.white)
+                Text("Leave empty to use auto-category (\(VPNRule.autoCategory(target: rule.target, label: rule.label))).")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.white.opacity(0.55))
+                TextField("Optional custom tag", text: $editingTagText)
+                    .textFieldStyle(.roundedBorder)
+                HStack {
+                    Button("Auto") {
+                        vpnService.updateRuleTag(rule, tag: "")
+                        editingTagRule = nil
+                    }
+                    Spacer()
+                    Button("Cancel") {
+                        editingTagRule = nil
+                    }
+                    Button("Save") {
+                        vpnService.updateRuleTag(rule, tag: editingTagText)
+                        editingTagRule = nil
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+            .padding(16)
+            .frame(width: 320)
+            .preferredColorScheme(.dark)
+        }
+    }
+
+    private func submitNewRule() {
+        let result = vpnService.addRuleResult(
+            target: newRuleTarget,
+            type: newRuleType,
+            label: newRuleLabel,
+            tag: newRuleTag
+        )
+        switch result {
+        case .added:
+            duplicateRuleAlert = nil
+            newRuleTarget = ""
+            newRuleLabel = ""
+            newRuleTag = ""
+        case .duplicate(let existing):
+            NSSound.beep()
+            duplicateRuleAlert = "'\(existing.target)' already exists in \(existing.resolvedCategory) — duplicate not added."
+        case .invalid:
+            break
         }
     }
 

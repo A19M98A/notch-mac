@@ -149,7 +149,63 @@ struct VPNRule: Identifiable, Codable, Equatable {
     var target: String
     var type: VPNRuleType = .domain
     var label: String = ""
+    var tag: String = ""
     var enabled: Bool = true
+
+    init(id: String = UUID().uuidString, target: String, type: VPNRuleType = .domain, label: String = "", tag: String = "", enabled: Bool = true) {
+        self.id = id
+        self.target = target
+        self.type = type
+        self.label = label
+        self.tag = tag
+        self.enabled = enabled
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        target = try c.decode(String.self, forKey: .target)
+        type = try c.decodeIfPresent(VPNRuleType.self, forKey: .type) ?? .domain
+        label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
+        tag = try c.decodeIfPresent(String.self, forKey: .tag) ?? ""
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+    }
+
+    /// Returns the user-assigned tag if present, or an auto-detected category based on target/label.
+    var resolvedCategory: String {
+        let custom = tag.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !custom.isEmpty { return custom }
+        return Self.autoCategory(target: target, label: label)
+    }
+
+    static func autoCategory(target: String, label: String) -> String {
+        let hay = "\(target) \(label)".lowercased()
+        if hay.contains("dota") || hay.contains("steam") || hay.contains("valve") || hay.contains("sdr") || hay.contains("155.133.") || hay.contains("162.254.") {
+            return "Dota 2 / Steam"
+        }
+        if hay.contains("google") || hay.contains("youtube") || hay.contains("youtu.be") || hay.contains("gstatic") || hay.contains("ggpht") {
+            return "Google / YouTube"
+        }
+        if hay.contains("telegram") || hay.contains("t.me") || hay.contains("91.108.") || hay.contains("149.154.") {
+            return "Telegram"
+        }
+        if hay.contains("apple") || hay.contains("icloud") || hay.contains("mzstatic") {
+            return "Apple & iCloud"
+        }
+        if hay.contains("openai") || hay.contains("chatgpt") || hay.contains("anthropic") || hay.contains("claude") || hay.contains("gemini") || hay.contains("perplexity") {
+            return "AI"
+        }
+        if hay.contains("github") || hay.contains("gitlab") || hay.contains("npmjs") || hay.contains("pypi") || hay.contains("docker") || hay.contains("brew") {
+            return "Dev"
+        }
+        if hay.contains("instagram") || hay.contains("whatsapp") || hay.contains("twitter") || hay.contains("x.com") || hay.contains("discord") || hay.contains("twitch") {
+            return "Social"
+        }
+        if hay.contains("cloudflare") || hay.contains("1.1.1.") || hay.contains("8.8.8.") {
+            return "DNS / CDN"
+        }
+        return "General"
+    }
 }
 
 struct VPNStoreData: Codable {

@@ -71,6 +71,19 @@ struct VPNTabView: View {
                     .buttonStyle(.plain)
 
                     Button {
+                        vpnService.refreshBypassAndIPs()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(vpnService.isRefreshingBypass ? .orange : .green)
+                            .frame(width: 22, height: 22)
+                            .background(Circle().fill(Color.white.opacity(0.08)))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(vpnService.isRefreshingBypass)
+                    .help("Refresh DNS & reload bypass IPs")
+
+                    Button {
                         vpnService.pingAllServers()
                     } label: {
                         Image(systemName: "speedometer")
