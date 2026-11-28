@@ -50,7 +50,6 @@ struct VPNConfigWindowView: View {
     @State private var newRuleLabel: String = ""
     @State private var newRuleTag: String = ""
     @State private var newRuleType: VPNRuleType = .domain
-    @State private var ruleSearchQuery: String = ""
     @State private var selectedRuleCategory: String = "All"
     @State private var selectedRuleKindFilter: RuleKindFilter = .all
     @State private var duplicateRuleAlert: String? = nil
@@ -559,8 +558,7 @@ struct VPNConfigWindowView: View {
     }
 
     private var filteredRules: [VPNRule] {
-        let q = ruleSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return vpnService.activeRules.filter { rule in
+        vpnService.activeRules.filter { rule in
             if selectedRuleCategory != "All" && rule.resolvedCategory != selectedRuleCategory {
                 return false
             }
@@ -572,11 +570,6 @@ struct VPNConfigWindowView: View {
             case .enabled: if !rule.enabled { return false }
             case .disabled: if rule.enabled { return false }
             }
-            if !q.isEmpty {
-                let ips = (vpnService.resolvedIPsByRuleID[rule.id] ?? []).joined(separator: " ")
-                let hay = "\(rule.target) \(rule.label) \(rule.tag) \(rule.resolvedCategory) \(ips)".lowercased()
-                if !hay.contains(q) { return false }
-            }
             return true
         }
     }
@@ -584,13 +577,9 @@ struct VPNConfigWindowView: View {
     private var rulesManagerView: some View {
         let allRules = vpnService.activeRules
         let visibleRules = filteredRules
-        let enabledCount = allRules.filter(\.enabled).count
-        let domainCount = allRules.filter { $0.type == .domain }.count
-        let ipCount = allRules.filter { $0.type == .ipCidr }.count
-        let resolvedTotal = vpnService.resolvedIPsByRuleID.values.reduce(0) { $0 + $1.count }
 
-        return VStack(alignment: .leading, spacing: 8) {
-            // Top Mode Switcher + Refresh Bypass + Import + Bulk Actions
+        return VStack(alignment: .leading, spacing: 10) {
+            // Top Mode Switcher + Refresh IPs + Bulk Actions
             HStack(spacing: 8) {
                 Picker("", selection: Binding(
                     get: { vpnService.store.mode },
@@ -615,7 +604,7 @@ struct VPNConfigWindowView: View {
                         Text(vpnService.isRefreshingBypass ? "Refreshing…" : "Refresh IPs")
                             .font(.system(size: 10, weight: .bold))
                     }
-                    .padding(.horizontal, 9)
+                    .padding(.horizontal, 10)
                     .padding(.vertical, 6)
                     .background(Capsule().fill(Color.green.opacity(vpnService.isRefreshingBypass ? 0.14 : 0.22)))
                     .foregroundStyle(.green)
@@ -623,23 +612,6 @@ struct VPNConfigWindowView: View {
                 .buttonStyle(.plain)
                 .disabled(vpnService.isRefreshingBypass)
                 .help("Flush DNS, resolve fresh IPs for domain rules & reload live bypass")
-
-                Button {
-                    vpnService.importBypassRulesFromOCPanel()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "tray.and.arrow.down")
-                            .font(.system(size: 10, weight: .bold))
-                        Text("Copy ocpanel")
-                            .font(.system(size: 10, weight: .bold))
-                    }
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 6)
-                    .background(Capsule().fill(Color.white.opacity(0.12)))
-                    .foregroundStyle(.white)
-                }
-                .buttonStyle(.plain)
-                .help("Copy bypass rules from ~/.config/ocpanel/config.json")
 
                 Menu {
                     Button("Enable Filtered (\(visibleRules.count))") {
@@ -674,27 +646,6 @@ struct VPNConfigWindowView: View {
             }
             .padding(.horizontal, 18)
 
-            // Stats / Info Strip
-            HStack(spacing: 10) {
-                Label("\(enabledCount)/\(allRules.count) active", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green.opacity(0.9))
-                Text("·").foregroundStyle(.white.opacity(0.3))
-                Text("\(domainCount) domains · \(ipCount) IP/CIDRs")
-                    .foregroundStyle(.white.opacity(0.6))
-                if resolvedTotal > 0 {
-                    Text("·").foregroundStyle(.white.opacity(0.3))
-                    Text("\(resolvedTotal) IPs resolved")
-                        .foregroundStyle(.cyan.opacity(0.85))
-                }
-                Spacer()
-                if let refreshed = vpnService.lastBypassRefreshAt {
-                    Text("Refreshed \(refreshed, style: .time)")
-                        .foregroundStyle(.white.opacity(0.45))
-                }
-            }
-            .font(.system(size: 10, weight: .medium, design: .monospaced))
-            .padding(.horizontal, 18)
-
             // Add Rule Row + Optional Tag + Duplicate Alert
             VStack(alignment: .leading, spacing: 7) {
                 HStack(spacing: 6) {
@@ -721,7 +672,7 @@ struct VPNConfigWindowView: View {
                         .font(.system(size: 11.5))
                         .padding(.horizontal, 9)
                         .padding(.vertical, 6)
-                        .frame(width: 112)
+                        .frame(width: 108)
                         .background(RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.55)))
                         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.10), lineWidth: 1))
 
@@ -807,39 +758,8 @@ struct VPNConfigWindowView: View {
             }
             .padding(.horizontal, 18)
 
-            // Search & Kind Filter + Auto-Category Chips
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "magnifyingglass")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.white.opacity(0.45))
-                        TextField("Search domain, IP, tag, or note…", text: $ruleSearchQuery)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 11.5))
-                        if !ruleSearchQuery.isEmpty {
-                            Button {
-                                ruleSearchQuery = ""
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.white.opacity(0.45))
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
-                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.06)))
-
-                    Picker("", selection: $selectedRuleKindFilter) {
-                        ForEach(RuleKindFilter.allCases) { f in
-                            Text(f.rawValue).tag(f)
-                        }
-                    }
-                    .frame(width: 96)
-                }
-
+            // Category Filter Chips + Kind Filter
+            HStack(spacing: 8) {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 5) {
                         ForEach(ruleCategories, id: \.name) { cat in
@@ -858,6 +778,13 @@ struct VPNConfigWindowView: View {
                         }
                     }
                 }
+
+                Picker("", selection: $selectedRuleKindFilter) {
+                    ForEach(RuleKindFilter.allCases) { f in
+                        Text(f.rawValue).tag(f)
+                    }
+                }
+                .frame(width: 92)
             }
             .padding(.horizontal, 18)
 
@@ -879,8 +806,7 @@ struct VPNConfigWindowView: View {
                     Text("No matching rules")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.55))
-                    Button("Clear Search & Filters") {
-                        ruleSearchQuery = ""
+                    Button("Show All Rules") {
                         selectedRuleCategory = "All"
                         selectedRuleKindFilter = .all
                     }
